@@ -141,8 +141,10 @@ class Topology:  # pylint: disable=too-few-public-methods
                 name=network.name,
                 cidr=network.cidr,
                 hosts=hosts_in_network,
-                accessible_by_roles=network.accessible_by_roles,
-                visible_by_roles=network.visible_by_roles,
+                # network may be the WAN pseudo-network here when _is_wan_network fails to
+                # recognize it by name; the WAN declares neither field.
+                accessible_by_roles=getattr(network, 'accessible_by_roles', None),
+                visible_by_roles=getattr(network, 'visible_by_roles', None),
             )
             subnets_dict[network.name] = subnet
 
