@@ -1,6 +1,9 @@
 """Tests for Ansible inventory generation."""
 
+from typing import Any
+
 import pytest
+from django.conf import settings
 
 from crczp.cloud_commons import TopologyInstance, TransformationConfiguration
 from crczp.sandbox_ansible_app.lib.inventory import Inventory, Routing
@@ -363,3 +366,92 @@ class TestRoleAwareInventoryMetadata:
         ti = _build_topology_instance(ROLE_AWARE_INVENTORY_DEFINITION)
         result = _build_inventory(ti).to_dict()
         assert result['all']['children']['hidden_hosts'] == {}
+
+
+class TestForwardingDestinationVars:
+    """Tests for the return-route variables on the network-forwarding destination host."""
+
+    @staticmethod
+    def _hosts(topology_instance: TopologyInstance) -> dict[str, Any]:
+        inventory = Inventory(
+            'pool-prefix',
+            'stack-name',
+            topology_instance,
+            '/root/.ssh/pool_mng_key',
+            '/root/.ssh/pool_mng_cert',
+            '/root/.ssh/pool_mng_key.pub',
+            '/root/.ssh/user_key.pub',
+        ).to_dict()
+        hosts: dict[str, Any] = inventory['all']['hosts']
+        return hosts
+
+    def test_destination_host_gets_router_ip_and_mac(self, top_ins_forwarding):
+        """The destination host carries the pinned router address and its own interface mac."""
+        hosts = self._hosts(top_ins_forwarding)
+
+        assert hosts['monitoring']['forwarding_router_ip'] == '10.10.40.3'
+        # The mac of monitoring's interface on monitoring-switch, not its first interface.
+        assert hosts['monitoring']['forwarding_destination_mac'] == '00:00:00:00:00:12'
+
+    def test_other_hosts_are_untouched(self, top_ins_forwarding):
+        """Only the destination gets the variables; the mirrored source does not."""
+        hosts = self._hosts(top_ins_forwarding)
+
+        for name in ('server', 'server-router', 'man'):
+            assert 'forwarding_router_ip' not in hosts[name]
+            assert 'forwarding_destination_mac' not in hosts[name]
+
+    def test_absent_without_forwarding(self, top_ins):
+        """A topology without a forwarding rule gets no return-route variables."""
+        hosts = self._hosts(top_ins)
+
+        assert all('forwarding_router_ip' not in host for host in hosts.values())
+
+    def test_absent_on_aws(self, mocker, top_ins_forwarding):
+        """The return route is an OpenStack concern; AWS mirrors to an ENI with no router."""
+        mocker.patch.object(settings, 'AWS_PROVIDER_CONFIGURED', True)
+
+        hosts = self._hosts(top_ins_forwarding)
+
+        assert 'forwarding_router_ip' not in hosts['monitoring']
+
+
+class TestUnmanagedPasswordHost:
+    """Tests for a password-authenticated, unmanaged host (e.g. an appliance without cloud-init)."""
+
+    @staticmethod
+    def _build(top_ins) -> dict[str, Any]:
+        return Inventory(
+            'pool-prefix',
+            'stack-name',
+            top_ins,
+            '/root/.ssh/pool_mng_key',
+            '/root/.ssh/pool_mng_cert',
+            '/root/.ssh/pool_mng_key.pub',
+            '/root/.ssh/user_key.pub',
+        ).to_dict()
+
+    def test_password_and_unmanaged_group(self, top_ins):
+        """A host with a password authenticates by password and lands in unmanaged_hosts."""
+        server_def = next(h for h in top_ins.topology_definition.hosts if h.name == 'server')
+        server_def.managed = False
+        server_def.base_box.mgmt_password = 'inv3a-t3ch'  # nosec B105
+
+        result = self._build(top_ins)
+
+        server_vars = result['all']['hosts']['server']
+        assert server_vars['ansible_password'] == 'inv3a-t3ch'
+        assert server_vars['ansible_connection'] == 'ssh'
+        assert 'interfaces' not in server_vars
+
+        children = result['all']['children']
+        assert 'server' in children['unmanaged_hosts']['hosts']
+        # Still reachable for the user-ansible stage — only the networking play is expected to skip.
+        assert 'server' in children['ssh_nodes']['hosts']
+
+    def test_managed_host_has_no_password_or_group(self, top_ins):
+        """Without the new fields, the inventory is unchanged: no password, no unmanaged group."""
+        result = self._build(top_ins)
+
+        assert 'ansible_password' not in result['all']['hosts']['server']
+        assert 'unmanaged_hosts' not in result['all'].get('children', {})

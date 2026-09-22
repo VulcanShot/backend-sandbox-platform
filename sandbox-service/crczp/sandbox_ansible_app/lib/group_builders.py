@@ -12,8 +12,10 @@ from itertools import chain
 from typing import TYPE_CHECKING
 
 import structlog
+from django.conf import settings
 
 from crczp.cloud_commons import TopologyInstance
+from crczp.openstack_driver.network_forwarding import router_interface_ip
 from crczp.sandbox_ansible_app.lib.inventory import (
     DefaultAnsibleHostsGroups,
     Group,
@@ -159,6 +161,17 @@ def _add_hidden_hosts_group(inventory: 'Inventory', topology: TopologyInstance) 
     inventory.add_group(Group(DefaultAnsibleHostsGroups.HIDDEN_HOSTS.value, hidden_hosts))
 
 
+def _add_unmanaged_hosts_group(inventory: 'Inventory', topology: TopologyInstance) -> None:
+    # Hosts the platform must not reconfigure (e.g. appliances without cloud-init). The stage-one
+    # networking playbook is expected to skip this group (hosts:!unmanaged_hosts). Added only when
+    # such a host exists, so topologies without one keep an unchanged inventory.
+    unmanaged_hosts = [
+        inventory.hosts[node.name] for node in topology.get_hosts() if not node.managed
+    ]
+    if unmanaged_hosts:
+        inventory.add_group(Group(DefaultAnsibleHostsGroups.UNMANAGED_HOSTS.value, unmanaged_hosts))
+
+
 def _add_docker_hosts_group(inventory: 'Inventory', topology: TopologyInstance) -> None:
     inventory.docker_hosts = None
     if topology.containers:
@@ -276,6 +289,36 @@ def _add_vpn_entrypoints_group(inventory: 'Inventory', topology: TopologyInstanc
     inventory.add_group(Group(DefaultAnsibleHostsGroups.VPN_ENTRYPOINTS.value, hosts))
 
 
+def _add_forwarding_destination_vars(inventory: 'Inventory', topology: TopologyInstance) -> None:
+    """
+    Add the return-route variables to the network-forwarding destination host.
+
+    Mirrored traffic reaches the destination through the per-sandbox router that exposes it
+    on a floating IP, but the node's default route points at the topology router on its
+    first interface, so replies would leave un-NATed through the wrong gateway. The
+    networking playbook turns these two variables plus ``global_hypervisor_cidr`` into a
+    static route back to the hypervisors over the destination interface.
+
+    OpenStack only: AWS mirrors to an ENI target with no router and no floating IP, so
+    there is no return route to install.
+    """
+    if settings.AWS_PROVIDER_CONFIGURED:
+        return
+    rule = topology.get_network_forwarding()
+    if not rule:
+        return
+    destination = rule.destination
+    host = inventory.hosts.get(destination.node.name)
+    if host is None:
+        return
+    host.add_variables(
+        forwarding_router_ip=router_interface_ip(
+            destination.network.name, destination.network.cidr
+        ),
+        forwarding_destination_mac=destination.mac,
+    )
+
+
 def _get_windows_hosts(inventory: 'Inventory', topology: TopologyInstance) -> list['Host']:
     """
     Return hosts that use Windows images based on the os_type parameter.
@@ -312,10 +355,12 @@ GROUP_BUILDERS: list[_Builder] = [
     _add_user_accessible_nodes_group,
     _add_user_visible_nodes_group,
     _add_hidden_hosts_group,
+    _add_unmanaged_hosts_group,
     _add_docker_hosts_group,
     _add_monitored_hosts_tcp_group,
     _add_monitored_hosts_icmp_group,
     _add_monitored_hosts_http_vars,
     _add_windows_hosts_group,
     _add_vpn_entrypoints_group,
+    _add_forwarding_destination_vars,
 ]

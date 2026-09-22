@@ -60,6 +60,10 @@ class BaseBox(Object):
         ),
         default=Protocol.SSH,
     )
+    # Password for SSH access, for images that cannot receive the injected management key
+    # (e.g. appliances without cloud-init). When set, the platform authenticates over SSH
+    # with a password instead of the management key.
+    mgmt_password = Attribute(type=str, default=None)
 
     @classmethod
     def from_yaml(cls, loader: Any, node: Any, _rtd: Any = None) -> 'BaseBox':
@@ -86,6 +90,7 @@ class Volume(Object):
     """
 
     size = Attribute(type=int, default=None)
+    image = Attribute(type=str, default=None)
 
 
 class VolumeList(Sequence):
@@ -109,6 +114,9 @@ class Host(Object):
     visible_by_roles = Attribute(
         type=StrList, default=None, validator=TopologyValidation.validate_visible_by_roles
     )
+    # When False, the host is deployed but excluded from the stage-one networking playbook
+    # (for appliances that manage their own networking and reject external reconfiguration).
+    managed = Attribute(type=bool, default=True)
     extra = Attribute(type=ExtraValues, default=None)
     volumes = Attribute(
         type=VolumeList, default=None, validator=TopologyValidation.is_volumes_valid
@@ -472,6 +480,51 @@ class Vpn(Object):
     dns = Attribute(type=VpnDns, default=None)
 
 
+class ForwardingInterface(Object):
+    """
+    A single interface in a network-forwarding rule, identified by a host and the
+    network it is attached to. Maps 1:1 to a Neutron port / AWS network interface.
+    """
+
+    host = Attribute(type=str)
+    network = Attribute(type=str)
+
+    def __init__(self, host: str, network: str) -> None:
+        self.host = host
+        self.network = network
+
+
+class ForwardingInterfaceList(Sequence):
+    """
+    List of forwarding interfaces.
+    """
+
+    item_type = ForwardingInterface
+
+
+class NetworkForwardingRule(Object):
+    """
+    Network traffic forwarding (port mirroring) rule. A copy of the traffic on one
+    or more source interfaces is delivered to a single destination interface.
+
+    A topology declares at most one rule, so the resources it renders are named after
+    the sandbox prefix alone and need no name of their own.
+
+    ``direction`` selects which traffic is mirrored relative to the source
+    (``in``/``out``/``both``).
+
+    A source may be a host or a router. The destination has to be a host and a
+    dedicated interface: its host needs at least two interfaces in ``net_mappings``,
+    and the first one, which the host routes through, cannot be used. The mirror
+    destination is reachable only from the hypervisors, so a host mirroring to its
+    default-routing interface would lose the rest of the sandbox.
+    """
+
+    sources = Attribute(type=ForwardingInterfaceList)
+    destination = Attribute(type=ForwardingInterface)
+    direction = Attribute(type=str, default='both')
+
+
 class TopologyDefinition(Object):  # pylint: disable=too-many-instance-attributes
     """
     Topology definition.
@@ -501,6 +554,11 @@ class TopologyDefinition(Object):  # pylint: disable=too-many-instance-attribute
         validator=TopologyValidation.validate_vpn,
         default=None,
     )
+    network_forwarding = Attribute(
+        type=NetworkForwardingRule,
+        validator=TopologyValidation.validate_network_forwarding,
+        default=None,
+    )
 
     # Class-level defaults so yamlize (which bypasses __init__) finds these attributes
     _indexed: bool = False
@@ -519,6 +577,7 @@ class TopologyDefinition(Object):  # pylint: disable=too-many-instance-attribute
         self.groups = GroupList()
         self.monitoring_targets = None
         self.vpn = None
+        self.network_forwarding = None
         self._indexed: bool = False
         self._hosts_index: dict[str, Host] = {}
         self._routers_index: dict[str, Router] = {}

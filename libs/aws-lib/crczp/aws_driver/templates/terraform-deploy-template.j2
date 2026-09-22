@@ -29,7 +29,7 @@ resource "aws_network_interface" "{{ name }}" {
 }
 {%- endmacro -%}
 
-{%- macro tf_instance(name, ami_id, instance_type, key_pair, link_names, default_ip) %}
+{%- macro tf_instance(name, ami_id, instance_type, key_pair, link_names, default_ip, volumes=[]) %}
 resource "aws_instance" "{{ name }}" {
     ami = "{{ ami_id }}"
     instance_type = "{{ instance_type }}"
@@ -37,6 +37,21 @@ resource "aws_instance" "{{ name }}" {
         Name = "{{ name }}"
     }
     key_name = "{{ key_pair }}"
+{%- if volumes %}
+    root_block_device {
+        volume_size = {{ volumes[0].size }}
+    }
+{%- for volume in volumes[1:] %}
+    ebs_block_device {
+        device_name = "/dev/sd{{ 'fghijklmnop'[loop.index0] }}"
+        volume_size = {{ volume.size }}
+{%- if volume.image is not none %}
+        snapshot_id = "{{ volume.image }}"
+{%- endif %}
+        delete_on_termination = true
+    }
+{%- endfor %}
+{%- endif %}
 
 {% for link_name in link_names %}
     network_interface {
@@ -72,7 +87,7 @@ EOF
     {%- set default_ip = get_default_route_ip(topology_instance, node) -%}
 
     {{ tf_instance(node_name, node.base_box.image, node.flavor,
-                   key_pair_name_ssh, link_names, default_ip) }}
+                   key_pair_name_ssh, link_names, default_ip, node.volumes) }}
 {% endfor %}
 
 data "aws_vpc" "base-vpc" {
@@ -120,3 +135,30 @@ resource "aws_instance" "{{ man_name }}" {
 {%- endfor %}
 }
 
+{#- Network forwarding (port mirroring) via AWS VPC Traffic Mirroring. Each source ENI is
+    mirrored (VXLAN-encapsulated) to the destination ENI target through a filter. -#}
+{% if traffic_mirror_plan.target %}
+resource "aws_ec2_traffic_mirror_target" "{{ traffic_mirror_plan.target.name }}" {
+    network_interface_id = aws_network_interface.{{ traffic_mirror_plan.target.dest_port_name }}.id
+}
+{% set mirror_filter = traffic_mirror_plan.mirror_filter %}
+resource "aws_ec2_traffic_mirror_filter" "{{ mirror_filter.name }}" {}
+{% for fr in mirror_filter.rules %}
+resource "aws_ec2_traffic_mirror_filter_rule" "{{ fr.name }}" {
+    traffic_mirror_filter_id = aws_ec2_traffic_mirror_filter.{{ mirror_filter.name }}.id
+    source_cidr_block        = "0.0.0.0/0"
+    destination_cidr_block   = "0.0.0.0/0"
+    rule_number              = {{ fr.rule_number }}
+    rule_action              = "accept"
+    traffic_direction        = "{{ fr.traffic_direction }}"
+}
+{% endfor -%}
+{% endif -%}
+{% for session in traffic_mirror_plan.sessions %}
+resource "aws_ec2_traffic_mirror_session" "{{ session.name }}" {
+    network_interface_id     = aws_network_interface.{{ session.source_port_name }}.id
+    traffic_mirror_target_id = aws_ec2_traffic_mirror_target.{{ session.target_name }}.id
+    traffic_mirror_filter_id = aws_ec2_traffic_mirror_filter.{{ session.filter_name }}.id
+    session_number           = {{ session.session_number }}
+}
+{% endfor -%}

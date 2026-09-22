@@ -41,19 +41,28 @@ class CrczpSSHConfig:
         proxy_jump: str | None = None,
         alias: str | None = None,
         port: int | None = None,
+        password_auth: bool = False,
         **kwargs: Any,
     ) -> None:
         """
         Create and add Host instance to this SSH config file.
+
+        With ``password_auth`` the entry still prefers the injected management key but falls back
+        to a password when the key is not accepted (for images that cannot receive the key, e.g.
+        appliances without cloud-init). The password itself is not stored here — SSH prompts for
+        it, and Ansible supplies it via ``ansible_password`` (which needs sshpass in the runner
+        image).
         """
         opts = {
             'HostName': host_name,
             'User': user,
             'IdentityFile': identity_file,
+            'IdentitiesOnly': 'yes',
             'UserKnownHostsFile': '/dev/null',
             'StrictHostKeyChecking': 'no',
-            'IdentitiesOnly': 'yes',
         }
+        if password_auth:
+            opts['PreferredAuthentications'] = 'publickey,password'
         if port is not None:
             opts['Port'] = str(port)
         if proxy_jump:
@@ -230,6 +239,7 @@ class CrczpMgmtSSHConfig(CrczpSSHConfig):
                 pool_private_key_path,
                 proxy_jump=man_proxy_jump,
                 alias=link.node.name,
+                password_auth=bool(getattr(link.node.base_box, 'mgmt_password', None)),
             )
 
     @classmethod

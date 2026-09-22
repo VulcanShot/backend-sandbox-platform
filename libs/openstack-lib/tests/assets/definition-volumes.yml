@@ -1,31 +1,28 @@
-name: small-sandbox
+name: small-definition
 hosts:
   - name: server
-    base_box: { image: crczp/debian-12-x86_64, mgmt_user: debian }
+    base_box: { image: debian-12-x86_64, mgmt_user: None }
     flavor: standard.small
     block_internet: True
     hidden: True
+    volumes:
+      - size: 20
+      - size: 30
+        image: data-disk-x86_64
+      - size: 40
 
   - name: home
-    base_box: { image: windows/windows-10-amd64, mgmt_protocol: winrm }
+    base_box: { image: debian-12-x86_64, mgmt_user: None }
     flavor: standard.small
-    extra:
-      hello: yello
-      yello: 5
-      foo: True
 
 routers:
   - name: server-router
-    base_box: { image: crczp/debian-12-x86_64, man_user: debian, mng_protocol: ssh }
+    base_box: { image: debian-12-x86_64 }
     flavor: standard.small
 
   - name: home-router
-    base_box: { image: debian/debian-12-x86_64 }
+    base_box: { image: debian-12-x86_64, mgmt_user: debian }
     flavor: standard.small
-
-wan:
-  name: internet-connection
-  cidr: 100.100.100.0/29
 
 networks:
   - name: server-switch
@@ -33,10 +30,7 @@ networks:
 
   - name: home-switch
     cidr: 10.10.30.0/24
-    accessible_by_user: False
-
-  - name: capture-switch
-    cidr: 10.10.50.0/24
+    accessible_by_user: True
 
 net_mappings:
   - host: server
@@ -47,10 +41,6 @@ net_mappings:
     network: home-switch
     ip: 10.10.30.5
 
-  - host: home
-    network: capture-switch
-    ip: 10.10.50.5
-
 router_mappings:
   - router: server-router
     network: server-switch
@@ -59,10 +49,6 @@ router_mappings:
   - router: home-router
     network: home-switch
     ip: 10.10.30.1
-
-  - router: home-router
-    network: capture-switch
-    ip: 10.10.50.1
 
 groups:
   - name: user-accessible
