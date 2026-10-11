@@ -472,6 +472,11 @@ class TestAllocationRequestHandler:
         )
         self.ansible_cancel = mocker.patch(ansible_cancel_patch_target, new_callable=PicklableMock)
 
+        mocker.patch(
+            'crczp.sandbox_instance_app.lib.request_handlers.definitions.get_definition',
+            return_value=mocker.MagicMock(get_declared_roles=lambda: set()),
+        )
+
     @pytest.mark.django_db(transaction=True)
     def test_enqueue_request(self, allocation_unit):
         handler = request_handlers.AllocationRequestHandler()
