@@ -109,9 +109,6 @@ class TestAllocationRequestHandlerUnit:
         mocker.patch(
             'crczp.sandbox_instance_app.lib.request_handlers.netbird.provision_netbird_for_sandbox'
         )
-        # Neutralise the definition git-fetch that per-role keypair generation
-        # would otherwise perform against the fake pool/definition URLs below.
-        mocker.patch('crczp.sandbox_instance_app.lib.request_handlers._generate_role_keypairs')
         self.handler = request_handlers.AllocationRequestHandler()
         self.fake_gen_ssh = mocker.patch(
             'crczp.sandbox_instance_app.lib.request_handlers.utils.generate_ssh_keypair'
@@ -474,7 +471,7 @@ class TestAllocationRequestHandler:
 
         mocker.patch(
             'crczp.sandbox_instance_app.lib.request_handlers.definitions.get_definition',
-            return_value=mocker.MagicMock(get_declared_roles=lambda: set()),
+            return_value=mocker.MagicMock(get_declared_roles=set),
         )
 
     @pytest.mark.django_db(transaction=True)
