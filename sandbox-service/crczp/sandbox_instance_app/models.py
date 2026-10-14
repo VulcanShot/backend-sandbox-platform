@@ -544,10 +544,10 @@ class SystemProcess(ExternalDependency):
 class SandboxNetbirdAccess(models.Model):
     """
     Stores one Netbird "access" group and setup key created for a sandbox. Every
-    sandbox has exactly one row with role='', the shared access group every VPN
-    entrypoint naming no role sources from and the setup key exposed to a
-    role-free requesting client; a sandbox whose pool declares roles
-    additionally has one further row per declared role.
+    sandbox has exactly one row with role='', the access group and setup key a
+    role-free pool's VPN entrypoints and clients use; a sandbox whose pool
+    declares roles additionally has one further row per declared role, and its
+    entrypoints and clients source from those role rows instead.
 
     All fields except role are nullable so that a partial-failure state can be
     persisted: the cleanup path tolerates nulls and issues 404-tolerant deletes.
@@ -657,6 +657,15 @@ class SandboxNetbirdResources(models.Model):
         default=None,
         help_text='Netbird access policy ID permitting client-to-host traffic.',
     )
+    source_roles = models.TextField(
+        null=True,
+        default=None,
+        help_text=(
+            "Comma-separated declared roles this entrypoint's policy and routes source "
+            'from; empty for the flat role or for no role. Null on a row created before '
+            'this field existed.'
+        ),
+    )
 
     class Meta:
         ordering = ['id']
@@ -678,6 +687,15 @@ class SandboxNetbirdResources(models.Model):
 
     def set_route_cidr_list(self, cidrs: list[str]) -> None:
         self.route_cidrs = ','.join(cidrs)
+
+    def get_source_role_list(self) -> list[str] | None:
+        """Return the declared roles sourcing this entrypoint, None on a pre-field row."""
+        if self.source_roles is None:
+            return None
+        return [r for r in self.source_roles.split(',') if r]
+
+    def set_source_role_list(self, roles: list[str]) -> None:
+        self.source_roles = ','.join(role for role in roles if role)
 
 
 class SandboxRequestGroup(models.Model):
