@@ -68,6 +68,16 @@ def _declaration_result(
     return bool(set(declared_roles) & users_roles)
 
 
+def _declared_role_union(declared_sets: list[list[str]]) -> list[str] | None:
+    """Union several declared role sets, or None if none of them were declared."""
+    if not declared_sets:
+        return None
+    union: set[str] = set()
+    for declared in declared_sets:
+        union.update(declared)
+    return sorted(union)
+
+
 class TopologyInstance:
     """
     Represents a topology instance.
@@ -243,21 +253,14 @@ class TopologyInstance:
         """
         Union the accessible_by_roles of every author-declared network a node is attached to.
 
-        None when none of its attached networks declare accessible_by_roles at all -
-        the node carries no role-scoped access secret and installs/serves the sandbox's
-        flat, role-free one instead.
+        None when none of its attached networks declare accessible_by_roles at all.
         """
         declared_sets = [
             link.network.accessible_by_roles
             for link in self.get_node_links(node, self.get_hosts_networks())
             if link.network.accessible_by_roles is not None
         ]
-        if not declared_sets:
-            return None
-        union: set[str] = set()
-        for declared in declared_sets:
-            union.update(declared)
-        return sorted(union)
+        return _declared_role_union(declared_sets)
 
     def get_network(self, name: str) -> Network | None:
         """

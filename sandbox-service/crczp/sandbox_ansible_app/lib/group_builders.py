@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 from crczp.cloud_commons import TopologyInstance
+from crczp.cloud_commons.topology_instance import _declared_role_union
 from crczp.sandbox_ansible_app.lib.inventory import (
     DefaultAnsibleHostsGroups,
     Group,
@@ -74,18 +75,6 @@ def _add_ssh_nodes_group(inventory: 'Inventory', topology: TopologyInstance) -> 
         if node.base_box.mgmt_protocol == Protocol.SSH and node != man
     ]
     inventory.add_group(Group(DefaultAnsibleHostsGroups.SSH_NODES.value, ssh_nodes))
-
-
-def _declared_role_union(
-    declared_sets: list[list[str]],
-) -> list[str] | None:
-    """Union several declared role sets, or None if none of them were declared."""
-    if not declared_sets:
-        return None
-    union: set[str] = set()
-    for declared in declared_sets:
-        union.update(declared)
-    return sorted(union)
 
 
 def _attached_author_declared_networks(
