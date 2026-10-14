@@ -179,19 +179,17 @@ class CrczpUserSSHConfig(CrczpSSHConfig):
                     user_accessible_links[first],
                 )
         # Create an entry for user-accessible nodes of a sandbox. A node carrying no
-        # accessible_by_roles metadata is unlocked by the flat key; one that does is
-        # unlocked by any one role's key among the roles it admits (the deterministic,
-        # lexicographically smallest one) — every role in that intersection already
-        # names a key installed on the node (§3.1), so the choice carries no security
-        # weight, and the intersection is never empty here since a node is only ever
-        # reached below once `users_roles` already has reach to it.
+        # accessible_by_roles metadata, or one whose declared roles none of the held
+        # keys match, is unlocked by the flat key; one with a match is unlocked by the
+        # lexicographically smallest matching role's key.
         for link in user_accessible_links:
             node_roles = top_ins.get_accessible_by_roles_for_node(link.node)
-            if node_roles is None:
-                identity_file = sandbox_private_key_path
-            else:
-                matching_role = min(set(node_roles) & role_private_key_paths.keys())
-                identity_file = role_private_key_paths[matching_role]
+            matching_roles = set(node_roles or ()) & role_private_key_paths.keys()
+            identity_file = (
+                role_private_key_paths[min(matching_roles)]
+                if matching_roles
+                else sandbox_private_key_path
+            )
             self.add_host(
                 link.ip,  # ty: ignore[invalid-argument-type]
                 SSH_PROXY_USERNAME,
