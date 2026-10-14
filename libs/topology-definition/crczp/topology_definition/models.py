@@ -746,6 +746,9 @@ class TopologyDefinition(Object):  # pylint: disable=too-many-instance-attribute
         for network in self.networks:
             roles.update(network.visible_by_roles or ())
             roles.update(network.accessible_by_roles or ())
+        if self.vpn is not None:
+            for entrypoint in self.vpn.entrypoints or ():
+                roles.update(entrypoint.accessible_by_roles or ())
         return roles
 
 
