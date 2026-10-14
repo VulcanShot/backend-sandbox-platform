@@ -340,7 +340,7 @@ def _provision_netbird_for_sandbox(sandbox: Sandbox) -> None:
     # role's group is simply absent from what entrypoints can source from.
     access_rows: dict[str, SandboxNetbirdAccess] = {}
     for role in ['', *sorted(declared_roles)]:
-        access_name = f'{stack_name}-access' if not role else f'{stack_name}-access-{role}'
+        access_name = f'{stack_name}-access' if not role else f'{stack_name}-access_{role}'
         try:
             access, _ = SandboxNetbirdAccess.objects.get_or_create(sandbox=sandbox, role=role)
             # Retained even if provisioning fails partway below, so the end
