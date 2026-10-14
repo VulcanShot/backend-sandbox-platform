@@ -119,7 +119,7 @@ class TestPrepareSshDir:
             sandbox=sandbox, role='red-team', private_key='priv-red', public_key='pub-red'
         )
 
-        runner = AllocationAnsibleRunner('/tmp')  # nosec B108
+        runner = AllocationAnsibleRunner('/tmp')
         runner.prepare_ssh_dir(sandbox.allocation_unit.pool, sandbox)
 
         written_paths = {call.args[0] for call in save_file.call_args_list}
@@ -138,14 +138,11 @@ class TestPrepareSshDir:
         mocker.patch.object(sandboxes, 'get_ansible_sshconfig', return_value='config')
 
         sandbox = Sandbox.objects.get(pk=1)
-        runner = AllocationAnsibleRunner('/tmp')  # nosec B108
+        runner = AllocationAnsibleRunner('/tmp')
         runner.prepare_ssh_dir(sandbox.allocation_unit.pool, sandbox)
 
         written_paths = [call.args[0] for call in save_file.call_args_list]
-        assert not any(
-            'user_key_' in path and path != runner.host_ssh_path('user_key.pub')
-            for path in written_paths
-        )
+        assert not any('user_key_' in path for path in written_paths)
 
 
 class TestGenerateDockerfiles:
