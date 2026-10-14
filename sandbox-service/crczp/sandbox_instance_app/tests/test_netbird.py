@@ -60,8 +60,8 @@ def netbird_cfg(mocker):
         f'{NETBIRD_MODULE}.settings.CRCZP_CONFIG',
         new=SimpleNamespace(netbird=SimpleNamespace(key_expiry_seconds=1209600)),
     )
-    # A role-free pool's declared role set, so provisioning takes exactly the
-    # branch that exists today; role-declaring scenarios override this.
+    # A role-free pool's declared role set, so provisioning takes the role-free
+    # branch; role-declaring scenarios override this.
     mocker.patch(f'{NETBIRD_MODULE}._get_declared_roles', return_value=set())
 
 
@@ -231,15 +231,21 @@ class TestProvision:
         assert SandboxNetbirdResources.objects.filter(sandbox=sandbox).count() == 0
 
     def test_skipped_when_no_entrypoints(self, mocker, sandbox):
-        """No entrypoints: nothing is created."""
+        """No entrypoints and no DNS: nothing is created, and no role lookup is made."""
         client = MagicMock()
         mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client', return_value=client)
         mocker.patch(f'{NETBIRD_MODULE}._get_vpn_entrypoints', return_value=[])
+        mocker.patch(f'{NETBIRD_MODULE}._get_vpn_dns', return_value=None)
+        get_declared_roles = mocker.patch(f'{NETBIRD_MODULE}._get_declared_roles')
 
         netbird.provision_netbird_for_sandbox(sandbox)
 
         client.create_group.assert_not_called()
         assert SandboxNetbirdResources.objects.filter(sandbox=sandbox).count() == 0
+        get_declared_roles.assert_not_called()
+        netbird.LOG.debug.assert_called_once_with(
+            'netbird_provision_skipped', sandbox_id=sandbox.id, reason='no_vpn_settings'
+        )
 
     def test_skipped_on_config_error(self, mocker, sandbox):
         """A config error building the client must not propagate or provision."""
@@ -833,7 +839,10 @@ class TestResolveVpnSetupKey:
         """A single-role holder gets that role's own stored key; no Netbird call is made."""
         SandboxNetbirdAccess.objects.create(sandbox=sandbox, access_setup_key_value='flat-key')
         SandboxNetbirdAccess.objects.create(
-            sandbox=sandbox, role='red-team', access_setup_key_value='red-team-key'
+            sandbox=sandbox,
+            role='red-team',
+            access_group_id='red-grp',
+            access_setup_key_value='red-team-key',
         )
         client_factory = mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client')
 
@@ -913,6 +922,73 @@ class TestResolveVpnSetupKey:
         _name, kwargs = client.create_setup_key.call_args
         assert set(kwargs['auto_group_ids']) == {'red-grp', 'blue-grp'}
 
+    def test_reason_is_none_when_a_key_is_resolved(self, sandbox):
+        """The reason is None alongside a successfully resolved key."""
+        SandboxNetbirdAccess.objects.create(sandbox=sandbox, access_setup_key_value='flat-key')
+
+        assert netbird.resolve_vpn_setup_key_with_reason(sandbox, frozenset()) == ('flat-key', None)
+
+    def test_reason_is_not_provisioned_for_an_unprovisioned_flat_pool(self, sandbox):
+        """A role-free pool whose flat row never got a key reports not_provisioned."""
+        assert netbird.resolve_vpn_setup_key_with_reason(sandbox, frozenset()) == (
+            None,
+            'not_provisioned',
+        )
+
+    def test_reason_is_no_role_for_a_roleless_requester(self, sandbox):
+        """A roleless requester in a role-declaring pool reports no_role."""
+        SandboxNetbirdAccess.objects.create(sandbox=sandbox, access_setup_key_value='flat-key')
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='red-team', access_group_id='red-grp'
+        )
+
+        assert netbird.resolve_vpn_setup_key_with_reason(sandbox, frozenset()) == (
+            None,
+            'no_role',
+        )
+
+    def test_reason_is_no_role_for_a_stray_grant_naming_no_declared_role(self, sandbox):
+        """A role held by the requester but declared on no access row reports no_role."""
+        SandboxNetbirdAccess.objects.create(sandbox=sandbox, access_setup_key_value='flat-key')
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='red-team', access_group_id='red-grp'
+        )
+
+        assert netbird.resolve_vpn_setup_key_with_reason(sandbox, frozenset({'observer'})) == (
+            None,
+            'no_role',
+        )
+
+    def test_reason_is_not_provisioned_for_an_admitted_but_unprovisioned_role(self, sandbox):
+        """An admitted role whose access group never provisioned reports not_provisioned."""
+        SandboxNetbirdAccess.objects.create(sandbox=sandbox, access_setup_key_value='flat-key')
+        SandboxNetbirdAccess.objects.create(sandbox=sandbox, role='red-team')
+
+        assert netbird.resolve_vpn_setup_key_with_reason(sandbox, frozenset({'red-team'})) == (
+            None,
+            'not_provisioned',
+        )
+
+    def test_reason_is_error_when_minting_a_multi_role_key_fails(
+        self, mocker, sandbox, netbird_cfg
+    ):
+        """A multi-role minting failure reports error."""
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='red-team', access_group_id='red-grp'
+        )
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='blue-team', access_group_id='blue-grp'
+        )
+        client = MagicMock()
+        client.create_setup_key.side_effect = NetbirdApiError('POST', 'url', 500, 'fail')
+        mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client', return_value=client)
+
+        result = netbird.resolve_vpn_setup_key_with_reason(
+            sandbox, frozenset({'red-team', 'blue-team'})
+        )
+
+        assert result == (None, 'error')
+
 
 class TestSandboxVpnView:
     """Tests for the sandbox VPN API view."""
@@ -959,6 +1035,7 @@ class TestSandboxVpnView:
         assert response.data == {
             'management_url': 'https://client.example.com',
             'setup_key': 'access-key-val',
+            'reason': None,
             'routes': ['10.0.0.0/24', '10.0.1.0/24', '10.0.2.0/24'],
             'command': (
                 'netbird up --management-url https://client.example.com --setup-key access-key-val'
@@ -979,6 +1056,7 @@ class TestSandboxVpnView:
         assert response.data == {
             'management_url': 'https://client.example.com',
             'setup_key': None,
+            'reason': 'not_provisioned',
             'routes': [],
             'command': None,
         }
@@ -1004,6 +1082,7 @@ class TestSandboxVpnView:
         assert response.data == {
             'management_url': 'https://client.example.com',
             'setup_key': None,
+            'reason': 'not_provisioned',
             'routes': [],
             'command': None,
         }
@@ -1016,7 +1095,10 @@ class TestSandboxVpnView:
         )
         SandboxNetbirdAccess.objects.create(sandbox=sandbox, access_setup_key_value='flat-key')
         SandboxNetbirdAccess.objects.create(
-            sandbox=sandbox, role='red-team', access_setup_key_value='red-team-key'
+            sandbox=sandbox,
+            role='red-team',
+            access_group_id='red-grp',
+            access_setup_key_value='red-team-key',
         )
 
         response = self._call(sandbox)
@@ -1041,6 +1123,7 @@ class TestSandboxVpnView:
         assert response.data == {
             'management_url': 'https://client.example.com',
             'setup_key': None,
+            'reason': 'no_role',
             'routes': [],
             'command': None,
         }

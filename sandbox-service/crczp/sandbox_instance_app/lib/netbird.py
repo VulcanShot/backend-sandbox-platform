@@ -175,11 +175,14 @@ def _provision_single_entrypoint(
     routes: list[str],
     key_expiry_seconds: int,
     access_group_ids: list[str],
+    source_roles: list[str],
 ) -> SandboxNetbirdResources:
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     nbr, _ = SandboxNetbirdResources.objects.get_or_create(
         sandbox=sandbox, entrypoint_host_name=host_name
     )
+    nbr.set_source_role_list(source_roles)
+    nbr.save()
 
     host_group_id = client.create_group(f'{stack_name}-{host_name}')
     nbr.host_group_id = host_group_id
@@ -193,6 +196,15 @@ def _provision_single_entrypoint(
     nbr.host_setup_key_id = host_key_id
     nbr.host_setup_key_value = host_key_value
     nbr.save()
+
+    if not access_group_ids:
+        # No role's access group resolved for this entrypoint (an empty declared
+        # list, a role named on no provisioned access row, or every named role
+        # failing to provision): a route or policy sourced from no group is
+        # rejected by Netbird, so none is created, and the entrypoint stays
+        # reachable by nobody rather than half-provisioned.
+        LOG.warning('netbird_entrypoint_unreachable', sandbox_id=sandbox.id, host=host_name)
+        return nbr
 
     route_ids = []
     for cidr in routes:
@@ -217,6 +229,104 @@ def _provision_single_entrypoint(
     nbr.save()
 
     return nbr
+
+
+def _provision_role_access(
+    client: NetbirdClient,
+    sandbox: Sandbox,
+    stack_name: str,
+    declared_roles: set[str],
+    key_expiry_seconds: int,
+) -> dict[str, SandboxNetbirdAccess]:
+    """Provision the sandbox's flat access group/key (role='') and one per declared role.
+
+    A failure on one role is caught and logged like a per-entrypoint failure: the
+    row is kept in the returned mapping (for the end guard or a later teardown to
+    find) even without a Netbird group, and that role is simply absent from what
+    an entrypoint can source from.
+    """
+    access_rows: dict[str, SandboxNetbirdAccess] = {}
+    for role in ['', *sorted(declared_roles)]:
+        access_name = f'{stack_name}-access' if not role else f'{stack_name}-access_{role}'
+        try:
+            access, _ = SandboxNetbirdAccess.objects.get_or_create(sandbox=sandbox, role=role)
+            access_rows[role] = access
+            _provision_access(client, access, access_name, key_expiry_seconds)
+            LOG.info(
+                'netbird_access_provisioned',
+                sandbox_id=sandbox.id,
+                role=role,
+                access_group_id=access.access_group_id,
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            event = (
+                'netbird_provision_failed'
+                if isinstance(exc, NetbirdApiError)
+                else 'netbird_provision_access_error'
+            )
+            LOG.warning(event, sandbox_id=sandbox.id, role=role, error=str(exc))
+    return access_rows
+
+
+def _provision_role_dns(
+    client: NetbirdClient,
+    sandbox: Sandbox,
+    stack_name: str,
+    access_rows: dict[str, SandboxNetbirdAccess],
+    dns: Any,
+) -> None:
+    """Provision a DNS nameserver group for every role with a provisioned access group.
+
+    Best-effort per role: a failure is caught and logged so the remaining roles
+    still get DNS distributed.
+    """
+    for role, access in access_rows.items():
+        if not access.access_group_id:
+            continue
+        try:
+            _provision_dns(client, sandbox, stack_name, access, dns)
+            LOG.info(
+                'netbird_dns_provisioned',
+                sandbox_id=sandbox.id,
+                role=role,
+                nameserver_group_id=access.dns_nameserver_group_id,
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            event = (
+                'netbird_provision_failed'
+                if isinstance(exc, NetbirdApiError)
+                else 'netbird_provision_dns_error'
+            )
+            LOG.warning(event, sandbox_id=sandbox.id, role=role, error=str(exc))
+
+
+def _source_roles(
+    ep_roles: list[str] | None,
+    declared_roles: set[str],
+    access_rows: dict[str, SandboxNetbirdAccess],
+) -> list[str]:
+    """Resolve the declared roles whose provisioned access group reaches an entrypoint.
+
+    No declaration (None) names every declared role, or the flat role='' for a
+    role-free pool. A declared (possibly empty) list names exactly those roles; a
+    role with no provisioned group (or an empty list) contributes nothing,
+    leaving the entrypoint reachable by no one.
+    """
+    candidate_roles = (
+        (sorted(declared_roles) if declared_roles else ['']) if ep_roles is None else list(ep_roles)
+    )
+    return [
+        role
+        for role in candidate_roles
+        if access_rows.get(role) is not None and access_rows[role].access_group_id
+    ]
+
+
+def _source_group_ids(
+    source_roles: list[str], access_rows: dict[str, SandboxNetbirdAccess]
+) -> list[str]:
+    """Resolve the access group ids backing an already-resolved set of source roles."""
+    return [access_rows[role].access_group_id for role in source_roles]
 
 
 def _teardown_provisioned_resources(
@@ -298,7 +408,6 @@ def _provision_netbird_for_sandbox(sandbox: Sandbox) -> None:
     try:
         entrypoints = _get_vpn_entrypoints(sandbox)
         dns = _get_vpn_dns(sandbox)
-        declared_roles = _get_declared_roles(sandbox)
     except Exception as exc:  # pylint: disable=broad-exception-caught
         # The topology definition is fetched from git here; any failure must not
         # break allocation, so we skip provisioning rather than crash the worker.
@@ -311,6 +420,17 @@ def _provision_netbird_for_sandbox(sandbox: Sandbox) -> None:
         return
     if not entrypoints and dns is None:
         LOG.debug('netbird_provision_skipped', sandbox_id=sandbox.id, reason='no_vpn_settings')
+        return
+
+    try:
+        declared_roles = _get_declared_roles(sandbox)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        LOG.warning(
+            'netbird_provision_skipped',
+            sandbox_id=sandbox.id,
+            reason='vpn_settings_lookup_failed',
+            error=str(exc),
+        )
         return
 
     # Start guard: bail out before making any cloud calls if the sandbox was
@@ -331,86 +451,27 @@ def _provision_netbird_for_sandbox(sandbox: Sandbox) -> None:
 
     created: list[SandboxNetbirdResources] = []
 
-    # Create the sandbox's flat access group + key, unconditionally, exactly as
-    # today (role=''), plus one further access group + key per declared role.
-    # Every entrypoint's policy and routes source from one or more of these
-    # groups, so they must exist before the entrypoint loop. A failure on one
-    # role is caught and logged like a per-entrypoint failure: the partial row
-    # is left for the end guard (or a later teardown) to clean up, and that
-    # role's group is simply absent from what entrypoints can source from.
-    access_rows: dict[str, SandboxNetbirdAccess] = {}
-    for role in ['', *sorted(declared_roles)]:
-        access_name = f'{stack_name}-access' if not role else f'{stack_name}-access_{role}'
-        try:
-            access, _ = SandboxNetbirdAccess.objects.get_or_create(sandbox=sandbox, role=role)
-            # Retained even if provisioning fails partway below, so the end
-            # guard/teardown can still find and delete a group already created
-            # in Netbird rather than orphan it.
-            access_rows[role] = access
-            _provision_access(client, access, access_name, key_expiry_seconds)
-            LOG.info(
-                'netbird_access_provisioned',
-                sandbox_id=sandbox.id,
-                role=role,
-                access_group_id=access.access_group_id,
-            )
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            event = (
-                'netbird_provision_failed'
-                if isinstance(exc, NetbirdApiError)
-                else 'netbird_provision_access_error'
-            )
-            LOG.warning(event, sandbox_id=sandbox.id, role=role, error=str(exc))
+    # Both the flat access group + key (role='') and one further group + key per
+    # declared role must exist before the entrypoint loop, which sources each
+    # entrypoint's policy and routes from one or more of them.
+    access_rows = _provision_role_access(
+        client, sandbox, stack_name, declared_roles, key_expiry_seconds
+    )
 
     if any(access.access_group_id for access in access_rows.values()):
-        # Provision a DNS nameserver group per successfully provisioned access
-        # group (best-effort) before the entrypoint loop. Each rides on its own
-        # access group like the policies/routes, so it is torn down by
-        # _destroy_access via the persisted group ID; a failure here is
-        # contained so the remaining roles and the entrypoints are still
-        # provisioned.
+        # DNS rides on each access group like the policies/routes, so it is
+        # torn down by _destroy_access via the persisted group ID.
         if dns is not None:
-            for role, access in access_rows.items():
-                if not access.access_group_id:
-                    continue
-                try:
-                    _provision_dns(client, sandbox, stack_name, access, dns)
-                    LOG.info(
-                        'netbird_dns_provisioned',
-                        sandbox_id=sandbox.id,
-                        role=role,
-                        nameserver_group_id=access.dns_nameserver_group_id,
-                    )
-                except Exception as exc:  # pylint: disable=broad-exception-caught
-                    event = (
-                        'netbird_provision_failed'
-                        if isinstance(exc, NetbirdApiError)
-                        else 'netbird_provision_dns_error'
-                    )
-                    LOG.warning(event, sandbox_id=sandbox.id, role=role, error=str(exc))
+            _provision_role_dns(client, sandbox, stack_name, access_rows, dns)
 
         for ep in entrypoints:
             host_name = ep.name
             routes = list(ep.routes)
             log = LOG.bind(sandbox_id=sandbox.id, stack_name=stack_name, host=host_name)
 
-            # No accessible_by_roles: every declared role's group (or the flat
-            # role='' group, for a role-free pool) — unchanged reachability for
-            # an entrypoint that names no team. A declared (possibly empty)
-            # list sources from exactly the named roles' groups; a role name
-            # with no provisioned row (or an empty list) contributes nothing,
-            # so the entrypoint is reachable by no one — fail closed.
             ep_roles = getattr(ep, 'accessible_by_roles', None)
-            source_roles = (
-                (sorted(declared_roles) if declared_roles else [''])
-                if ep_roles is None
-                else list(ep_roles)
-            )
-            access_group_ids = [
-                access_rows[role].access_group_id
-                for role in source_roles
-                if access_rows.get(role) is not None and access_rows[role].access_group_id
-            ]
+            source_roles = _source_roles(ep_roles, declared_roles, access_rows)
+            access_group_ids = _source_group_ids(source_roles, access_rows)
 
             try:
                 nbr = _provision_single_entrypoint(
@@ -421,6 +482,7 @@ def _provision_netbird_for_sandbox(sandbox: Sandbox) -> None:
                     routes,
                     key_expiry_seconds,
                     access_group_ids,
+                    source_roles,
                 )
                 created.append(nbr)
                 log.info('netbird_provisioned', policy_id=nbr.policy_id)
@@ -674,10 +736,25 @@ def resolve_vpn_setup_key(sandbox: Sandbox, users_roles: UsersRoles) -> str | No
     requester resolving to no role in a role-declaring pool gets none, failing
     closed.
     """
+    return resolve_vpn_setup_key_with_reason(sandbox, users_roles)[0]
+
+
+def resolve_vpn_setup_key_with_reason(
+    sandbox: Sandbox, users_roles: UsersRoles
+) -> tuple[str | None, str | None]:
+    """Resolve `resolve_vpn_setup_key`'s key alongside a reason for a null one.
+
+    The reason is None whenever a key is returned; otherwise one of: 'no_role'
+    (the requester holds none of the sandbox's declared roles), 'not_provisioned'
+    (an admitted role's access group or setup key never finished provisioning),
+    or 'error' (minting a multi-role key failed).
+    """
     declared_rows = SandboxNetbirdAccess.objects.filter(sandbox=sandbox).exclude(role='')
     if not declared_rows.exists():
         flat_access = SandboxNetbirdAccess.objects.filter(sandbox=sandbox, role='').first()
-        return flat_access.access_setup_key_value if flat_access else None
+        if flat_access and flat_access.access_setup_key_value:
+            return flat_access.access_setup_key_value, None
+        return None, 'not_provisioned'
 
     if isinstance(users_roles, frozenset):
         resolved_roles = set(users_roles)
@@ -685,16 +762,21 @@ def resolve_vpn_setup_key(sandbox: Sandbox, users_roles: UsersRoles) -> str | No
         resolved_roles = set(declared_rows.values_list('role', flat=True))
 
     if not resolved_roles:
-        return None
+        return None, 'no_role'
 
-    matching_rows = list(
+    candidate_rows = list(
         SandboxNetbirdAccess.objects.filter(sandbox=sandbox, role__in=resolved_roles)
     )
+    if not candidate_rows:
+        return None, 'no_role'
+    matching_rows = [row for row in candidate_rows if row.access_group_id]
     if not matching_rows:
-        return None
+        return None, 'not_provisioned'
     if len(matching_rows) == 1:
-        return matching_rows[0].access_setup_key_value
-    return _mint_ephemeral_vpn_setup_key(sandbox, matching_rows)
+        key = matching_rows[0].access_setup_key_value
+        return (key, None) if key else (None, 'not_provisioned')
+    key = _mint_ephemeral_vpn_setup_key(sandbox, matching_rows)
+    return (key, None) if key else (None, 'error')
 
 
 def _mint_ephemeral_vpn_setup_key(
@@ -708,9 +790,11 @@ def _mint_ephemeral_vpn_setup_key(
     """
     try:
         client = get_netbird_client()
-    except NetbirdConfigError:
+    except NetbirdConfigError as exc:
+        LOG.warning('netbird_ephemeral_key_failed', sandbox_id=sandbox.id, error=str(exc))
         return None
     if client is None:
+        LOG.warning('netbird_ephemeral_key_failed', sandbox_id=sandbox.id, error='no_config')
         return None
 
     stack_name = _short_stack_name(sandbox.allocation_unit.get_stack_name())
@@ -721,7 +805,26 @@ def _mint_ephemeral_vpn_setup_key(
             auto_group_ids=[row.access_group_id for row in access_rows if row.access_group_id],
             expires_in_seconds=key_expiry_seconds,
         )
-    except NetbirdApiError as exc:
+    except Exception as exc:  # pylint: disable=broad-exception-caught
         LOG.warning('netbird_ephemeral_key_failed', sandbox_id=sandbox.id, error=str(exc))
         return None
     return key_value
+
+
+def resolve_vpn_routes(sandbox: Sandbox, users_roles: UsersRoles) -> list[str]:
+    """Return the CIDRs of `sandbox`'s entrypoints a requester's roles can reach.
+
+    An entrypoint sourced from the flat role, from no role, or from a row that
+    predates this tracking (`None`) is reachable by every requester.
+    """
+    routes: list[str] = []
+    for nbr in sandbox.netbird_resources.all():
+        source_roles = nbr.get_source_role_list()
+        if (
+            source_roles
+            and isinstance(users_roles, frozenset)
+            and not set(source_roles) & users_roles
+        ):
+            continue
+        routes.extend(nbr.get_route_cidr_list())
+    return list(dict.fromkeys(routes))

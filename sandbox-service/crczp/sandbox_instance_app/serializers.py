@@ -498,6 +498,7 @@ class SandboxVpnConfigSerializer(serializers.Serializer[Any]):
 
     management_url = serializers.CharField()
     setup_key = serializers.CharField(allow_null=True)
+    reason = serializers.CharField(allow_null=True)
     routes = serializers.ListField(child=serializers.CharField())
 
 

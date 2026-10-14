@@ -1255,9 +1255,13 @@ class SandboxVpnView(APIView):
     a role-declaring pool grants a role's own key to a single-role holder, a
     freshly minted key spanning every held role's access group to a multi-role
     holder, and no key to a roleless requester. ``routes`` is the union of the
-    CIDRs reachable through the sandbox's VPN entrypoints. ``setup_key`` is null
-    while the relevant access resources are still being provisioned (or when
-    the sandbox has no VPN entrypoints).
+    CIDRs of entrypoints the same roles can reach.
+
+    ``setup_key`` is null whenever ``reason`` is not: ``no_role`` (the requester
+    holds none of the sandbox's declared roles), ``not_provisioned`` (an
+    admitted role's Netbird objects have not, or never will, finish
+    provisioning), or ``error`` (minting a multi-role key failed). ``reason`` is
+    null whenever ``setup_key`` is present.
 
     ``command`` is the ready-to-run NetBird CLI line a client pastes to connect
     (it embeds ``management_url`` and ``setup_key``); it is null whenever
@@ -1279,15 +1283,13 @@ class SandboxVpnView(APIView):
         """Returns the Netbird VPN client configuration for this sandbox."""
         sandbox = sandboxes.get_sandbox(self.kwargs['sandbox_uuid'])
         users_roles = roles.resolve_users_roles(request, sandbox.allocation_unit.pool)
-        setup_key = netbird.resolve_vpn_setup_key(sandbox, users_roles)
+        setup_key, reason = netbird.resolve_vpn_setup_key_with_reason(sandbox, users_roles)
         management_url = get_client_management_url()
 
         routes: list[str] = []
         command: str | None = None
         if setup_key:
-            for nbr in sandbox.netbird_resources.all():
-                routes.extend(nbr.get_route_cidr_list())
-            routes = list(dict.fromkeys(routes))
+            routes = netbird.resolve_vpn_routes(sandbox, users_roles)
             # Build the command server-side so the NetBird CLI syntax lives in
             # one place; shlex.quote keeps a key/URL with shell-special
             # characters from breaking when pasted into a shell.
@@ -1299,6 +1301,7 @@ class SandboxVpnView(APIView):
         return Response({
             'management_url': management_url,
             'setup_key': setup_key,
+            'reason': reason,
             'routes': routes,
             'command': command,
         })
