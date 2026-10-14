@@ -675,16 +675,17 @@ def resolve_vpn_setup_key(sandbox: Sandbox, users_roles: UsersRoles) -> str | No
     closed.
     """
     declared_rows = SandboxNetbirdAccess.objects.filter(sandbox=sandbox).exclude(role='')
+    if not declared_rows.exists():
+        flat_access = SandboxNetbirdAccess.objects.filter(sandbox=sandbox, role='').first()
+        return flat_access.access_setup_key_value if flat_access else None
+
     if isinstance(users_roles, frozenset):
         resolved_roles = set(users_roles)
     else:
         resolved_roles = set(declared_rows.values_list('role', flat=True))
 
     if not resolved_roles:
-        if declared_rows.exists():
-            return None
-        flat_access = SandboxNetbirdAccess.objects.filter(sandbox=sandbox, role='').first()
-        return flat_access.access_setup_key_value if flat_access else None
+        return None
 
     matching_rows = list(
         SandboxNetbirdAccess.objects.filter(sandbox=sandbox, role__in=resolved_roles)
