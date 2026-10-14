@@ -99,8 +99,8 @@ class TestRoleAwareUserSshConfig:
     """Tests for reach-gated SSH entries, independent of visibility."""
 
     @staticmethod
-    def _build_topology_instance() -> TopologyInstance:
-        topology_definition = TopologyDefinition.load(ROLE_GATED_SSH_DEFINITION)
+    def _build_topology_instance(definition: str = ROLE_GATED_SSH_DEFINITION) -> TopologyInstance:
+        topology_definition = TopologyDefinition.load(definition)
         trc_config = TransformationConfiguration(
             man_image='debian-12-x86_64', man_flavor='standard.small', man_user='debian'
         )
@@ -168,15 +168,7 @@ class TestRoleAwareUserSshConfig:
         definition = ROLE_GATED_SSH_DEFINITION.replace(
             'accessible_by_roles: [red-team]', 'accessible_by_roles: [red-team, observer]'
         )
-        topology_definition = TopologyDefinition.load(definition)
-        trc_config = TransformationConfiguration(
-            man_image='debian-12-x86_64', man_flavor='standard.small', man_user='debian'
-        )
-        top_ins = TopologyInstance(topology_definition, trc_config)
-        top_ins.ip = '10.10.10.10'
-        for link in top_ins.get_links():
-            if link.network.name == 'target-lan':
-                link.ip = '10.10.10.5'
+        top_ins = self._build_topology_instance(definition)
 
         proxy_jump = settings.CRCZP_CONFIG.proxy_jump_to_man
         result = sshconfig.CrczpUserSSHConfig(
