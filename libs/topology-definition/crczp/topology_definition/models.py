@@ -508,7 +508,8 @@ class VpnEntrypoint(Object):
         """
         Load VpnEntrypoint from YAML.
         """
-        reject_null_value(node.value, 'accessible_by_roles')
+        if isinstance(node, MappingNode):
+            reject_null_value(node.value, 'accessible_by_roles')
         return super().from_yaml(loader, node, _rtd)
 
 
