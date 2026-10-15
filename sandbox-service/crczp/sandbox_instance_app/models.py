@@ -698,6 +698,33 @@ class SandboxNetbirdResources(models.Model):
         self.source_roles = ','.join(role for role in roles if role)
 
 
+class SandboxNetbirdEphemeralKey(models.Model):
+    """
+    Stores one Netbird setup key minted for a multi-role requester's exact
+    combination of held roles, so a repeat request for that same combination
+    reuses it instead of minting (and eventually orphaning) another.
+    """
+
+    # Implicit FK attribute; Sandbox has a CharField primary key.
+    sandbox_id: str
+
+    sandbox = models.ForeignKey(
+        Sandbox,
+        on_delete=models.CASCADE,
+        related_name='netbird_ephemeral_keys',
+        help_text='Sandbox this key was minted for.',
+    )
+    role_set = models.TextField(
+        help_text='Sorted, comma-separated roles this key spans, identifying the combination.',
+    )
+    key_id = models.CharField(max_length=255, help_text='Netbird setup key ID.')
+    key_value = models.TextField(help_text='Plaintext setup key value.')
+
+    class Meta:
+        unique_together = [('sandbox', 'role_set')]
+        verbose_name_plural = 'sandbox netbird ephemeral keys'
+
+
 class SandboxRequestGroup(models.Model):
     """
     Represents allocation/cleanup requests created at the same time.
