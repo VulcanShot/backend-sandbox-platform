@@ -117,20 +117,27 @@ def _provision_access(
     access: SandboxNetbirdAccess,
     access_name: str,
     key_expiry_seconds: int,
+    flat_group_id: str | None = None,
 ) -> None:
     """Populate one role's (or the sandbox's flat) access group and setup key onto ``access``.
 
     Every entrypoint reachable by ``access``'s role sources its policy and routes
     from this access group; the setup key is what a client resolving to this role
-    is issued via the VPN API endpoint.
+    is issued via the VPN API endpoint. ``flat_group_id``, when given, is also named
+    on the key so its holder stays able to reach entrypoints sourced from the flat
+    role alone, homologous to a Network's accessible_by_user: True fallback.
     """
     access_group_id = client.create_group(access_name)
     access.access_group_id = access_group_id
     access.save()
 
+    auto_group_ids = [access_group_id]
+    if flat_group_id and flat_group_id != access_group_id:
+        auto_group_ids.append(flat_group_id)
+
     access_key_id, access_key_value = client.create_setup_key(
         name=access_name,
-        auto_group_ids=[access_group_id],
+        auto_group_ids=auto_group_ids,
         expires_in_seconds=key_expiry_seconds,
     )
     access.access_setup_key_id = access_key_id
@@ -250,14 +257,20 @@ def _provision_role_access(
     row is kept in the returned mapping (for the end guard or a later teardown to
     find) even without a Netbird group, and that role is simply absent from what
     an entrypoint can source from.
+
+    Every role's key also names the flat access group (provisioned first, role=''),
+    so a role holder stays able to reach entrypoints sourced from the flat role alone.
     """
     access_rows: dict[str, SandboxNetbirdAccess] = {}
+    flat_group_id: str | None = None
     for role in ['', *sorted(declared_roles)]:
         access_name = f'{stack_name}-access' if not role else f'{stack_name}-access_{role}'
         try:
             access, _ = SandboxNetbirdAccess.objects.get_or_create(sandbox=sandbox, role=role)
             access_rows[role] = access
-            _provision_access(client, access, access_name, key_expiry_seconds)
+            _provision_access(client, access, access_name, key_expiry_seconds, flat_group_id)
+            if not role:
+                flat_group_id = access.access_group_id
             LOG.info(
                 'netbird_access_provisioned',
                 sandbox_id=sandbox.id,
@@ -308,19 +321,16 @@ def _provision_role_dns(
 
 def _source_roles(
     ep_roles: list[str] | None,
-    declared_roles: set[str],
     access_rows: dict[str, SandboxNetbirdAccess],
 ) -> list[str]:
     """Resolve the declared roles whose provisioned access group reaches an entrypoint.
 
-    No declaration (None) names every declared role, or the flat role='' for a
-    role-free pool. A declared (possibly empty) list names exactly those roles; a
-    role with no provisioned group (or an empty list) contributes nothing,
-    leaving the entrypoint reachable by no one.
+    No declaration (None) names the flat role='', reachable by every player regardless
+    of team — homologous to a Network's accessible_by_user: True fallback. A declared
+    (possibly empty) list names exactly those roles; a role with no provisioned group
+    (or an empty list) contributes nothing, leaving the entrypoint reachable by no one.
     """
-    candidate_roles = (
-        (sorted(declared_roles) if declared_roles else ['']) if ep_roles is None else list(ep_roles)
-    )
+    candidate_roles = [''] if ep_roles is None else list(ep_roles)
     return [
         role
         for role in candidate_roles
@@ -476,7 +486,7 @@ def _provision_netbird_for_sandbox(sandbox: Sandbox) -> None:
             log = LOG.bind(sandbox_id=sandbox.id, stack_name=stack_name, host=host_name)
 
             ep_roles = getattr(ep, 'accessible_by_roles', None)
-            source_roles = _source_roles(ep_roles, declared_roles, access_rows)
+            source_roles = _source_roles(ep_roles, access_rows)
             access_group_ids = _source_group_ids(source_roles, access_rows)
 
             try:
@@ -689,7 +699,9 @@ def destroy_netbird_for_sandbox(sandbox: Sandbox) -> None:
         return
 
     nbr_qs = SandboxNetbirdResources.objects.filter(sandbox=sandbox)
-    access_qs = SandboxNetbirdAccess.objects.filter(sandbox=sandbox)
+    # Descending by role: every role-specific key also names the flat group, so
+    # the flat row ('', sorting last) must be destroyed after every other row.
+    access_qs = SandboxNetbirdAccess.objects.filter(sandbox=sandbox).order_by('-role')
     ephemeral_qs = SandboxNetbirdEphemeralKey.objects.filter(sandbox=sandbox)
     if not nbr_qs.exists() and not access_qs.exists() and not ephemeral_qs.exists():
         return
@@ -753,16 +765,21 @@ def destroy_netbird_for_sandbox(sandbox: Sandbox) -> None:
             )
 
 
+def _flat_access_row(sandbox: Sandbox) -> SandboxNetbirdAccess | None:
+    """Return the sandbox's flat (role='') access row, or None if never provisioned."""
+    return SandboxNetbirdAccess.objects.filter(sandbox=sandbox, role='').first()
+
+
 def resolve_vpn_setup_key(sandbox: Sandbox, users_roles: UsersRoles) -> str | None:
     """Resolve the Netbird setup key a requesting user's roles admit for `sandbox`.
 
     A role-free pool (or a privileged requester when no role is declared) gets
     the sandbox's one shared, stored setup key, unchanged. A requester resolving
     to exactly one role gets that role's own stored key, no new Netbird call. One
-    resolving to several roles at once gets a single, unpersisted setup key
-    minted on the spot naming every one of those roles' access groups. A
-    requester resolving to no role in a role-declaring pool gets none, failing
-    closed.
+    resolving to several roles at once gets a single setup key, minted once and
+    then reused, naming every one of those roles' access groups. A requester
+    resolving to no declared role gets the flat key when one is provisioned,
+    homologous to an unscoped entrypoint's own fallback.
     """
     return resolve_vpn_setup_key_with_reason(sandbox, users_roles)[0]
 
@@ -773,13 +790,14 @@ def resolve_vpn_setup_key_with_reason(
     """Resolve `resolve_vpn_setup_key`'s key alongside a reason for a null one.
 
     The reason is None whenever a key is returned; otherwise one of: 'no_role'
-    (the requester holds none of the sandbox's declared roles), 'not_provisioned'
-    (an admitted role's access group or setup key never finished provisioning),
-    or 'error' (minting a multi-role key failed).
+    (the requester holds none of the sandbox's declared roles, and no flat key is
+    provisioned either), 'not_provisioned' (an admitted role's access group or
+    setup key never finished provisioning), or 'error' (minting a multi-role key
+    failed).
     """
     declared_rows = SandboxNetbirdAccess.objects.filter(sandbox=sandbox).exclude(role='')
     if not declared_rows.exists():
-        flat_access = SandboxNetbirdAccess.objects.filter(sandbox=sandbox, role='').first()
+        flat_access = _flat_access_row(sandbox)
         if flat_access and flat_access.access_setup_key_value:
             return flat_access.access_setup_key_value, None
         return None, 'not_provisioned'
@@ -790,12 +808,18 @@ def resolve_vpn_setup_key_with_reason(
         resolved_roles = set(declared_rows.values_list('role', flat=True))
 
     if not resolved_roles:
+        flat_access = _flat_access_row(sandbox)
+        if flat_access and flat_access.access_setup_key_value:
+            return flat_access.access_setup_key_value, None
         return None, 'no_role'
 
     candidate_rows = list(
         SandboxNetbirdAccess.objects.filter(sandbox=sandbox, role__in=resolved_roles)
     )
     if not candidate_rows:
+        flat_access = _flat_access_row(sandbox)
+        if flat_access and flat_access.access_setup_key_value:
+            return flat_access.access_setup_key_value, None
         return None, 'no_role'
     matching_rows = [row for row in candidate_rows if row.access_group_id]
     if not matching_rows:
@@ -833,10 +857,14 @@ def _mint_ephemeral_vpn_setup_key(
 
     stack_name = _short_stack_name(sandbox.allocation_unit.get_stack_name())
     key_expiry_seconds = settings.CRCZP_CONFIG.netbird.key_expiry_seconds
+    auto_group_ids = {row.access_group_id for row in access_rows if row.access_group_id}
+    flat_access = _flat_access_row(sandbox)
+    if flat_access and flat_access.access_group_id:
+        auto_group_ids.add(flat_access.access_group_id)
     try:
         key_id, key_value = client.create_setup_key(
             name=f'{stack_name}-access-ephemeral_{role_set.replace(",", "_")}',
-            auto_group_ids=[row.access_group_id for row in access_rows if row.access_group_id],
+            auto_group_ids=list(auto_group_ids),
             expires_in_seconds=key_expiry_seconds,
         )
     except Exception as exc:  # pylint: disable=broad-exception-caught

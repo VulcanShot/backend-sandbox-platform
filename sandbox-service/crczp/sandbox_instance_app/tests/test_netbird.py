@@ -619,6 +619,57 @@ class TestProvision:
         ]
         assert len(set(names)) == len(names)
 
+    def test_role_keys_also_name_the_flat_access_group(self, mocker, sandbox):
+        """Each role's stored key also names the flat group, not just its own."""
+        mocker.patch(
+            f'{NETBIRD_MODULE}.settings.CRCZP_CONFIG',
+            new=SimpleNamespace(netbird=SimpleNamespace(key_expiry_seconds=1209600)),
+        )
+        mocker.patch(f'{NETBIRD_MODULE}._get_declared_roles', return_value={'red-team'})
+        client = MagicMock()
+        client.create_group.side_effect = ['flat-grp', 'red-grp']
+        client.create_setup_key.side_effect = [
+            ('flat-key-id', 'flat-key'),
+            ('red-key-id', 'red-key'),
+        ]
+        client.create_nameserver_group.side_effect = ['flat-ns', 'red-ns']
+        mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client', return_value=client)
+        mocker.patch(f'{NETBIRD_MODULE}._get_vpn_entrypoints', return_value=[])
+        mocker.patch(f'{NETBIRD_MODULE}._get_vpn_dns', return_value=FakeDns(['10.0.0.5']))
+
+        netbird.provision_netbird_for_sandbox(sandbox)
+
+        flat_call, red_call = client.create_setup_key.call_args_list
+        assert set(flat_call.kwargs['auto_group_ids']) == {'flat-grp'}
+        assert set(red_call.kwargs['auto_group_ids']) == {'red-grp', 'flat-grp'}
+
+    def test_unscoped_entrypoint_sources_from_the_flat_group_alone(
+        self, mocker, sandbox, netbird_cfg
+    ):
+        """An entrypoint declaring no accessible_by_roles sources from the flat group alone."""
+        mocker.patch(f'{NETBIRD_MODULE}._get_declared_roles', return_value={'red-team'})
+        client = MagicMock()
+        client.create_group.side_effect = ['flat-grp', 'red-grp', 'host-grp']
+        client.create_setup_key.side_effect = [
+            ('flat-key-id', 'flat-key'),
+            ('red-key-id', 'red-key'),
+            ('host-key-id', 'host-key'),
+        ]
+        client.create_route.return_value = 'route-1'
+        client.create_policy.return_value = 'pol-1'
+        mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client', return_value=client)
+        mocker.patch(
+            f'{NETBIRD_MODULE}._get_vpn_entrypoints',
+            return_value=[FakeEntrypoint('server', ['10.0.0.0/24'])],
+        )
+
+        netbird.provision_netbird_for_sandbox(sandbox)
+
+        _name, kwargs = client.create_policy.call_args
+        assert kwargs['source_group_ids'] == ['flat-grp']
+        nbr = SandboxNetbirdResources.objects.get(sandbox=sandbox, entrypoint_host_name='server')
+        assert nbr.get_source_role_list() == []
+
 
 class TestDestroy:
     """Tests for destroy_netbird_for_sandbox."""
@@ -779,6 +830,38 @@ class TestDestroy:
         assert calls.count('delete_group') == 2
         assert not SandboxNetbirdEphemeralKey.objects.filter(sandbox=sandbox).exists()
 
+    def test_destroys_the_flat_access_row_last(self, mocker, sandbox):
+        """The flat row's group is destroyed only after every role row's key is gone.
+
+        Every role's stored key also names the flat group, so deleting the flat
+        group before a role's key is gone would be rejected by Netbird.
+        """
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, access_group_id='flat-grp', access_setup_key_id='flat-key-id'
+        )
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox,
+            role='red-team',
+            access_group_id='red-grp',
+            access_setup_key_id='red-key-id',
+        )
+        client = MagicMock()
+        client.list_group_peer_ids.return_value = []
+        mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client', return_value=client)
+
+        netbird.destroy_netbird_for_sandbox(sandbox)
+
+        calls = list(client.method_calls)
+        red_key_delete = next(
+            i
+            for i, c in enumerate(calls)
+            if c[0] == 'delete_setup_key' and c.args[0] == 'red-key-id'
+        )
+        flat_group_delete = next(
+            i for i, c in enumerate(calls) if c[0] == 'delete_group' and c.args[0] == 'flat-grp'
+        )
+        assert red_key_delete < flat_group_delete
+
     def test_deletes_all_resources_and_row(self, mocker, sandbox):
         """All resources are deleted in order and the rows removed."""
         self._create_full_resources(sandbox)
@@ -892,9 +975,18 @@ class TestResolveVpnSetupKey:
 
         assert netbird.resolve_vpn_setup_key(sandbox, frozenset()) == 'flat-key'
 
-    def test_roleless_requester_in_role_declaring_pool_gets_none(self, sandbox):
-        """A requester resolving to no role in a role-declaring pool is fail-closed."""
+    def test_roleless_requester_in_role_declaring_pool_gets_the_flat_key(self, sandbox):
+        """A requester resolving to no role in a role-declaring pool falls back to the flat key."""
         SandboxNetbirdAccess.objects.create(sandbox=sandbox, access_setup_key_value='flat-key')
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='red-team', access_setup_key_value='red-team-key'
+        )
+
+        assert netbird.resolve_vpn_setup_key(sandbox, frozenset()) == 'flat-key'
+
+    def test_roleless_requester_gets_none_when_no_flat_key_either(self, sandbox):
+        """A requester resolving to no role gets None when no flat key is provisioned either."""
+        SandboxNetbirdAccess.objects.create(sandbox=sandbox)
         SandboxNetbirdAccess.objects.create(
             sandbox=sandbox, role='red-team', access_setup_key_value='red-team-key'
         )
@@ -1025,9 +1117,21 @@ class TestResolveVpnSetupKey:
             'not_provisioned',
         )
 
-    def test_reason_is_no_role_for_a_roleless_requester(self, sandbox):
-        """A roleless requester in a role-declaring pool reports no_role."""
+    def test_roleless_requester_gets_the_flat_key_when_one_is_provisioned(self, sandbox):
+        """A roleless requester in a role-declaring pool falls back to the flat key."""
         SandboxNetbirdAccess.objects.create(sandbox=sandbox, access_setup_key_value='flat-key')
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='red-team', access_group_id='red-grp'
+        )
+
+        assert netbird.resolve_vpn_setup_key_with_reason(sandbox, frozenset()) == (
+            'flat-key',
+            None,
+        )
+
+    def test_reason_is_no_role_for_a_roleless_requester_with_no_flat_key(self, sandbox):
+        """A roleless requester reports no_role when no flat key is provisioned either."""
+        SandboxNetbirdAccess.objects.create(sandbox=sandbox)
         SandboxNetbirdAccess.objects.create(
             sandbox=sandbox, role='red-team', access_group_id='red-grp'
         )
@@ -1037,16 +1141,16 @@ class TestResolveVpnSetupKey:
             'no_role',
         )
 
-    def test_reason_is_no_role_for_a_stray_grant_naming_no_declared_role(self, sandbox):
-        """A role held by the requester but declared on no access row reports no_role."""
+    def test_stray_grant_naming_no_declared_role_gets_the_flat_key(self, sandbox):
+        """A role held by the requester but declared on no access row falls back to the flat key."""
         SandboxNetbirdAccess.objects.create(sandbox=sandbox, access_setup_key_value='flat-key')
         SandboxNetbirdAccess.objects.create(
             sandbox=sandbox, role='red-team', access_group_id='red-grp'
         )
 
         assert netbird.resolve_vpn_setup_key_with_reason(sandbox, frozenset({'observer'})) == (
+            'flat-key',
             None,
-            'no_role',
         )
 
     def test_reason_is_not_provisioned_for_an_admitted_but_unprovisioned_role(self, sandbox):
@@ -1196,13 +1300,39 @@ class TestSandboxVpnView:
         assert response.status_code == 200
         assert response.data['setup_key'] == 'red-team-key'
 
-    def test_roleless_requester_in_role_declaring_pool_receives_nothing(self, mocker, sandbox):
-        """A requester resolving to no role in a role-declaring pool receives no key."""
+    def test_roleless_requester_in_role_declaring_pool_receives_the_flat_key(self, mocker, sandbox):
+        """A requester resolving to no role in a role-declaring pool gets the flat key."""
         mocker.patch(
             'crczp.sandbox_instance_app.views.roles.resolve_users_roles',
             return_value=frozenset(),
         )
         SandboxNetbirdAccess.objects.create(sandbox=sandbox, access_setup_key_value='flat-key')
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='red-team', access_setup_key_value='red-team-key'
+        )
+
+        response = self._call(sandbox)
+
+        assert response.status_code == 200
+        assert response.data == {
+            'management_url': 'https://client.example.com',
+            'setup_key': 'flat-key',
+            'reason': None,
+            'routes': [],
+            'command': (
+                'netbird up --management-url https://client.example.com --setup-key flat-key'
+            ),
+        }
+
+    def test_roleless_requester_in_role_declaring_pool_with_no_flat_key_receives_nothing(
+        self, mocker, sandbox
+    ):
+        """A requester resolving to no role gets nothing when no flat key is provisioned either."""
+        mocker.patch(
+            'crczp.sandbox_instance_app.views.roles.resolve_users_roles',
+            return_value=frozenset(),
+        )
+        SandboxNetbirdAccess.objects.create(sandbox=sandbox)
         SandboxNetbirdAccess.objects.create(
             sandbox=sandbox, role='red-team', access_setup_key_value='red-team-key'
         )
