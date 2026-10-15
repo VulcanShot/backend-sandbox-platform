@@ -48,6 +48,50 @@ class TestGetSandbox:
         assert sandboxes.get_sandbox(sandbox.id) is not None
 
 
+class TestGenerateRoleKeypairs:
+    """Tests for generating a sandbox's per-role SSH keypairs."""
+
+    def test_creates_one_keypair_per_declared_role(self, mocker, sandbox):
+        """One SandboxRoleKeypair row is created per role the definition declares."""
+        mocker.patch(
+            'crczp.sandbox_instance_app.lib.sandboxes.definitions.get_definition',
+            return_value=mock.MagicMock(get_declared_roles=lambda: {'red-team', 'blue-team'}),
+        )
+
+        sandboxes.generate_role_keypairs(sandbox, sandbox.allocation_unit.pool)
+
+        roles = set(sandbox.role_keypairs.values_list('role', flat=True))
+        assert roles == {'red-team', 'blue-team'}
+
+    def test_declaring_no_role_creates_no_keypair(self, mocker, sandbox):
+        """A role-free definition creates no SandboxRoleKeypair rows."""
+        mocker.patch(
+            'crczp.sandbox_instance_app.lib.sandboxes.definitions.get_definition',
+            return_value=mock.MagicMock(get_declared_roles=set),
+        )
+
+        sandboxes.generate_role_keypairs(sandbox, sandbox.allocation_unit.pool)
+
+        assert not sandbox.role_keypairs.exists()
+
+    def test_rerun_for_an_already_generated_role_is_a_no_op(self, mocker, sandbox):
+        """A role with an existing row is left untouched by a rerun."""
+        mocker.patch(
+            'crczp.sandbox_instance_app.lib.sandboxes.definitions.get_definition',
+            return_value=mock.MagicMock(get_declared_roles=lambda: {'red-team'}),
+        )
+        existing = SandboxRoleKeypair.objects.create(
+            sandbox=sandbox, role='red-team', private_key='priv', public_key='pub'
+        )
+
+        sandboxes.generate_role_keypairs(sandbox, sandbox.allocation_unit.pool)
+
+        assert sandbox.role_keypairs.count() == 1
+        existing.refresh_from_db()
+        assert existing.private_key == 'priv'
+        assert existing.public_key == 'pub'
+
+
 class TestSandboxesManipulation:
     """Tests for sandbox locking, topology, and SSH config operations."""
 

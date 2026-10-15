@@ -27,7 +27,7 @@ from crczp.sandbox_instance_app.lib.sshconfig import (
     CrczpUserSSHConfig,
 )
 from crczp.sandbox_instance_app.lib.topology import Topology
-from crczp.sandbox_instance_app.models import Sandbox, SandboxLock, SandboxRoleKeypair
+from crczp.sandbox_instance_app.models import Pool, Sandbox, SandboxLock, SandboxRoleKeypair
 from crczp.topology_definition.models import DockerContainers, Host, Router, TopologyDefinition
 
 SANDBOX_CACHE_TIMEOUT = None  # Cache indefinitely
@@ -131,6 +131,22 @@ def get_user_sshconfig(
         proxy_port=proxy_jump.Port,
         role_private_key_paths=role_private_key_paths,
     )
+
+
+def generate_role_keypairs(sandbox: Sandbox, pool: Pool) -> None:
+    """Generate one SandboxRoleKeypair per role the pool's definition declares.
+
+    A role already holding a row (same sandbox, same role) is left untouched, so
+    a rerun for a sandbox partway through generation is safe.
+    """
+    top_def = definitions.get_definition(pool.definition.url, pool.rev_sha, settings.CRCZP_CONFIG)
+    keypairs = []
+    for role in top_def.get_declared_roles():
+        pri_key, pub_key = utils.generate_ssh_keypair()
+        keypairs.append(
+            SandboxRoleKeypair(sandbox=sandbox, role=role, private_key=pri_key, public_key=pub_key)
+        )
+    SandboxRoleKeypair.objects.bulk_create(keypairs, ignore_conflicts=True)
 
 
 def _role_keypairs_for(
