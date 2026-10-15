@@ -15,7 +15,12 @@ from crczp.sandbox_common_lib.netbird_client import (
     get_netbird_client,
 )
 from crczp.sandbox_definition_app.lib import definitions
-from crczp.sandbox_instance_app.models import Sandbox, SandboxNetbirdAccess, SandboxNetbirdResources
+from crczp.sandbox_instance_app.models import (
+    Sandbox,
+    SandboxNetbirdAccess,
+    SandboxNetbirdEphemeralKey,
+    SandboxNetbirdResources,
+)
 
 LOG = structlog.get_logger()
 
@@ -153,9 +158,10 @@ def _provision_dns(
     if not servers or not access_group_id:
         return
     search_domains = [str(d) for d in (getattr(dns, 'search_domains', None) or [])]
+    dns_name = f'{stack_name}-dns' if not access.role else f'{stack_name}-dns_{access.role}'
 
     nameserver_group_id = client.create_nameserver_group(
-        name=f'{stack_name}-dns',
+        name=dns_name,
         servers=servers,
         distribution_group_ids=[access_group_id],
         primary=not search_domains,
@@ -684,7 +690,8 @@ def destroy_netbird_for_sandbox(sandbox: Sandbox) -> None:
 
     nbr_qs = SandboxNetbirdResources.objects.filter(sandbox=sandbox)
     access_qs = SandboxNetbirdAccess.objects.filter(sandbox=sandbox)
-    if not nbr_qs.exists() and not access_qs.exists():
+    ephemeral_qs = SandboxNetbirdEphemeralKey.objects.filter(sandbox=sandbox)
+    if not nbr_qs.exists() and not access_qs.exists() and not ephemeral_qs.exists():
         return
 
     deadline = time.monotonic() + _teardown_budget_seconds()
@@ -705,9 +712,30 @@ def destroy_netbird_for_sandbox(sandbox: Sandbox) -> None:
                 error=str(exc),
             )
 
+    # Delete every minted multi-role key before the access groups it references:
+    # Netbird rejects deleting a group a setup key still names.
+    for ephemeral in ephemeral_qs:
+        if _expired(deadline):
+            LOG.warning(
+                'netbird_destroy_time_budget_exceeded',
+                sandbox_id=sandbox.id,
+                stage='ephemeral_keys',
+            )
+            return
+        try:
+            client.delete_setup_key(ephemeral.key_id)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            LOG.warning(
+                'netbird_destroy_ephemeral_key_failed',
+                sandbox_id=sandbox.id,
+                role_set=ephemeral.role_set,
+                error=str(exc),
+            )
+        ephemeral.delete()
+
     # Tear down every role's access resources last: every entrypoint policy/route
-    # that referenced any access group has now been deleted, so none of the
-    # groups are in use any longer and all of them can be removed.
+    # and ephemeral key that referenced any access group has now been deleted, so
+    # none of the groups are in use any longer and all of them can be removed.
     for access in access_qs:
         if _expired(deadline):
             LOG.warning(
@@ -775,19 +803,25 @@ def resolve_vpn_setup_key_with_reason(
     if len(matching_rows) == 1:
         key = matching_rows[0].access_setup_key_value
         return (key, None) if key else (None, 'not_provisioned')
-    key = _mint_ephemeral_vpn_setup_key(sandbox, matching_rows)
+    role_set = ','.join(sorted(row.role for row in matching_rows))
+    key = _mint_ephemeral_vpn_setup_key(sandbox, role_set, matching_rows)
     return (key, None) if key else (None, 'error')
 
 
 def _mint_ephemeral_vpn_setup_key(
-    sandbox: Sandbox, access_rows: list[SandboxNetbirdAccess]
+    sandbox: Sandbox, role_set: str, access_rows: list[SandboxNetbirdAccess]
 ) -> str | None:
-    """Mint a fresh, unpersisted setup key spanning every one of ``access_rows``'s groups.
+    """Resolve the setup key spanning every one of ``access_rows``'s groups.
 
-    Specific to one player's one resolved multi-role combination at one moment;
-    it is never written to a row, and Netbird's own ``expires_in_seconds``
-    retires it.
+    Persisted per (sandbox, role_set): a repeat request for the same role
+    combination reuses the stored key rather than minting (and eventually
+    orphaning) another. Netbird's own ``expires_in_seconds`` bounds its
+    lifetime, exactly as every other provisioned key's.
     """
+    existing = SandboxNetbirdEphemeralKey.objects.filter(sandbox=sandbox, role_set=role_set).first()
+    if existing is not None:
+        return existing.key_value
+
     try:
         client = get_netbird_client()
     except NetbirdConfigError as exc:
@@ -800,14 +834,17 @@ def _mint_ephemeral_vpn_setup_key(
     stack_name = _short_stack_name(sandbox.allocation_unit.get_stack_name())
     key_expiry_seconds = settings.CRCZP_CONFIG.netbird.key_expiry_seconds
     try:
-        _key_id, key_value = client.create_setup_key(
-            name=f'{stack_name}-access-ephemeral',
+        key_id, key_value = client.create_setup_key(
+            name=f'{stack_name}-access-ephemeral_{role_set.replace(",", "_")}',
             auto_group_ids=[row.access_group_id for row in access_rows if row.access_group_id],
             expires_in_seconds=key_expiry_seconds,
         )
     except Exception as exc:  # pylint: disable=broad-exception-caught
         LOG.warning('netbird_ephemeral_key_failed', sandbox_id=sandbox.id, error=str(exc))
         return None
+    SandboxNetbirdEphemeralKey.objects.create(
+        sandbox=sandbox, role_set=role_set, key_id=key_id, key_value=key_value
+    )
     return key_value
 
 

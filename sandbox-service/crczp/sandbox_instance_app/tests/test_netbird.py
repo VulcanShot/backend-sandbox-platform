@@ -20,6 +20,7 @@ from crczp.sandbox_instance_app.lib import netbird
 from crczp.sandbox_instance_app.models import (
     Sandbox,
     SandboxNetbirdAccess,
+    SandboxNetbirdEphemeralKey,
     SandboxNetbirdResources,
 )
 from crczp.sandbox_instance_app.views import SandboxVpnView
@@ -586,6 +587,38 @@ class TestProvision:
         client.create_policy.assert_not_called()
         assert SandboxNetbirdResources.objects.filter(sandbox=sandbox).count() == 0
 
+    def test_dns_uses_a_role_qualified_name_per_role(self, mocker, sandbox):
+        """Each role's nameserver group is named uniquely, avoiding a Netbird name clash."""
+        mocker.patch(
+            f'{NETBIRD_MODULE}.settings.CRCZP_CONFIG',
+            new=SimpleNamespace(netbird=SimpleNamespace(key_expiry_seconds=1209600)),
+        )
+        mocker.patch(
+            f'{NETBIRD_MODULE}._get_declared_roles', return_value={'red-team', 'blue-team'}
+        )
+        client = MagicMock()
+        client.create_group.side_effect = ['flat-grp', 'blue-grp', 'red-grp']
+        client.create_setup_key.side_effect = [
+            ('flat-key-id', 'flat-key'),
+            ('blue-key-id', 'blue-key'),
+            ('red-key-id', 'red-key'),
+        ]
+        client.create_nameserver_group.side_effect = ['flat-ns', 'blue-ns', 'red-ns']
+        mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client', return_value=client)
+        mocker.patch(f'{NETBIRD_MODULE}._get_vpn_entrypoints', return_value=[])
+        mocker.patch(f'{NETBIRD_MODULE}._get_vpn_dns', return_value=FakeDns(['10.0.0.5']))
+
+        netbird.provision_netbird_for_sandbox(sandbox)
+
+        stack_name = netbird._short_stack_name(sandbox.allocation_unit.get_stack_name())
+        names = [call.kwargs['name'] for call in client.create_nameserver_group.call_args_list]
+        assert names == [
+            f'{stack_name}-dns',
+            f'{stack_name}-dns_blue-team',
+            f'{stack_name}-dns_red-team',
+        ]
+        assert len(set(names)) == len(names)
+
 
 class TestDestroy:
     """Tests for destroy_netbird_for_sandbox."""
@@ -712,6 +745,39 @@ class TestDestroy:
             [call('red-key-id'), call('blue-key-id')], any_order=True
         )
         assert not SandboxNetbirdAccess.objects.filter(pk__in=[red.pk, blue.pk]).exists()
+
+    def test_deletes_ephemeral_keys_before_the_access_groups_they_reference(self, mocker, sandbox):
+        """A minted multi-role key is deleted before the access groups it names."""
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='red-team', access_group_id='red-grp'
+        )
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='blue-team', access_group_id='blue-grp'
+        )
+        SandboxNetbirdEphemeralKey.objects.create(
+            sandbox=sandbox, role_set='blue-team,red-team', key_id='ephemeral-id', key_value='v'
+        )
+        client = MagicMock()
+        client.list_group_peer_ids.return_value = []
+        mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client', return_value=client)
+
+        netbird.destroy_netbird_for_sandbox(sandbox)
+
+        calls = [c[0] for c in client.method_calls]
+        ephemeral_calls = [
+            i
+            for i, c in enumerate(client.method_calls)
+            if c[0] == 'delete_setup_key' and c.args[0] == 'ephemeral-id'
+        ]
+        group_calls = [
+            i
+            for i, c in enumerate(client.method_calls)
+            if c[0] == 'delete_group' and c.args[0] in ('red-grp', 'blue-grp')
+        ]
+        assert ephemeral_calls and len(group_calls) == 2
+        assert max(ephemeral_calls) < min(group_calls)
+        assert calls.count('delete_group') == 2
+        assert not SandboxNetbirdEphemeralKey.objects.filter(sandbox=sandbox).exists()
 
     def test_deletes_all_resources_and_row(self, mocker, sandbox):
         """All resources are deleted in order and the rows removed."""
@@ -851,7 +917,7 @@ class TestResolveVpnSetupKey:
         assert result == 'red-team-key'
         client_factory.assert_not_called()
 
-    def test_multi_role_holder_gets_a_fresh_unpersisted_key(self, mocker, sandbox, netbird_cfg):
+    def test_multi_role_holder_gets_a_freshly_minted_key(self, mocker, sandbox, netbird_cfg):
         """A multi-role holder gets one freshly minted key naming every held role's group."""
         red = SandboxNetbirdAccess.objects.create(
             sandbox=sandbox,
@@ -874,11 +940,35 @@ class TestResolveVpnSetupKey:
         assert result == 'ephemeral-key'
         _name, kwargs = client.create_setup_key.call_args
         assert set(kwargs['auto_group_ids']) == {'red-grp', 'blue-grp'}
-        # Never persisted onto either row.
+        # Not written onto either role's own row.
         red.refresh_from_db()
         blue.refresh_from_db()
         assert red.access_setup_key_value == 'red-team-key'
         assert blue.access_setup_key_value == 'blue-team-key'
+        # Persisted under the role combination instead, so a repeat request reuses it.
+        stored = SandboxNetbirdEphemeralKey.objects.get(
+            sandbox=sandbox, role_set='blue-team,red-team'
+        )
+        assert stored.key_id == 'ephemeral-id'
+        assert stored.key_value == 'ephemeral-key'
+
+    def test_multi_role_holder_reuses_a_previously_minted_key(self, mocker, sandbox, netbird_cfg):
+        """A repeat request for the same role combination reuses the stored key."""
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='red-team', access_group_id='red-grp'
+        )
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='blue-team', access_group_id='blue-grp'
+        )
+        SandboxNetbirdEphemeralKey.objects.create(
+            sandbox=sandbox, role_set='blue-team,red-team', key_id='old-id', key_value='old-key'
+        )
+        client_factory = mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client')
+
+        result = netbird.resolve_vpn_setup_key(sandbox, frozenset({'red-team', 'blue-team'}))
+
+        assert result == 'old-key'
+        client_factory.assert_not_called()
 
     def test_multi_role_holder_gets_none_when_netbird_unreachable(
         self, mocker, sandbox, netbird_cfg
