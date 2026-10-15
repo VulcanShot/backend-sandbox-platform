@@ -20,7 +20,7 @@ hosts:
   - name: secret
     base_box: { image: debian-12-x86_64, mgmt_user: debian }
     flavor: standard.small
-    visible_by_roles: []
+    hidden: true
 
 routers:
   - name: gw-a

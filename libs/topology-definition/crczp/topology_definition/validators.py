@@ -352,9 +352,15 @@ class TopologyValidation:  # pylint: disable=too-many-public-methods
     @staticmethod
     def validate_visible_by_roles(obj: object, roles: StrList | None) -> None:
         """
-        Validate a declared visible_by_roles list.
+        Validate a declared visible_by_roles list. An empty list is rejected.
         """
         if roles is not None:
+            if not roles:
+                raise ValueError(
+                    f'{obj.__class__.__name__}.visible_by_roles must not be an empty list; '
+                    'omit the field to admit every role, or name at least one role to admit. '
+                    'Use hidden: true to conceal a node from every role.'
+                )
             TopologyValidation._validate_role_list(obj, roles, 'visible_by_roles')
 
     @staticmethod

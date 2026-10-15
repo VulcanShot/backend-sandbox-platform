@@ -719,28 +719,16 @@ vpn:
         assert home_dict['visible_by_roles'] == ['blue_team', 'red-team']
         assert 'hidden' not in home_dict
 
-    def test_visible_by_roles_round_trip_with_empty_list(
-        self, topology_definition_string: str
-    ) -> None:
+    def test_visible_by_roles_rejected_empty_list(self, topology_definition_string: str) -> None:
         """
-        A host's visible_by_roles: [] ("nobody") round-trips as [], not None ("everyone").
+        visible_by_roles: [] is rejected.
         """
-        td = TopologyDefinition.load(
-            topology_definition_string.replace(
-                '    flavor: standard.small\n    extra:',
-                '    flavor: standard.small\n    visible_by_roles: []\n    extra:',
-            )
+        modified = topology_definition_string.replace(
+            '    flavor: standard.small\n    extra:',
+            '    flavor: standard.small\n    visible_by_roles: []\n    extra:',
         )
-
-        home = td.find_host_by_name('home')
-        assert home is not None
-        assert list(home.visible_by_roles) == []
-
-        dumped_stream = io.StringIO()
-        TopologyDefinition.dump(td, dumped_stream)
-        reloaded = dict(YAML(typ='safe', pure=True).load(dumped_stream.getvalue()))
-        home_dict = next(h for h in reloaded['hosts'] if h['name'] == 'home')
-        assert home_dict['visible_by_roles'] == []
+        with pytest.raises(YamlizingError):
+            TopologyDefinition.load(modified)
 
     def test_accessible_by_roles_round_trip(self, topology_definition_string: str) -> None:
         """
