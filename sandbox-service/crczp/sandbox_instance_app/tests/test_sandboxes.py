@@ -12,6 +12,7 @@ from crczp.sandbox_common_lib import exceptions
 from crczp.sandbox_instance_app import serializers
 from crczp.sandbox_instance_app.lib import sandboxes, sshconfig
 from crczp.sandbox_instance_app.models import Sandbox, SandboxAllocationUnit, SandboxRoleKeypair
+from crczp.sandbox_instance_app.tests.test_sshconfig import TestRoleAwareUserSshConfig
 
 pytestmark = pytest.mark.django_db
 
@@ -180,9 +181,7 @@ class TestSandboxesManipulation:
             with zip_file.open(f'{private_key}.pub') as file:
                 assert file.read().decode('utf-8') == sandbox.public_user_key
 
-    def test_get_user_ssh_access_role_free_zip_carries_no_role_keys(
-        self, mocker, sandbox, user_ssh_config
-    ):
+    def test_get_user_ssh_access_role_free_zip_carries_no_role_keys(self, mocker, sandbox):
         """A role-free sandbox's zip carries only the flat key, no role-scoped ones."""
         sandbox.allocation_unit.get_stack_name = mocker.MagicMock()
         sandbox.allocation_unit.get_stack_name.return_value = 'stack-name'
@@ -195,6 +194,37 @@ class TestSandboxesManipulation:
             names = zip_file.namelist()
             assert private_key in names
             assert not any(name.startswith(f'{private_key}-') for name in names)
+
+    @pytest.mark.parametrize(
+        'users_roles',
+        [frozenset(), frozenset({'red-team'}), UNIVERSAL_ROLES],
+    )
+    def test_get_user_ssh_access_identity_files_all_exist_in_the_zip(
+        self, mocker, sandbox, users_roles
+    ):
+        """Every IdentityFile the generated config names is a key file in the same zip."""
+        self.mock_get_top_ins.return_value = TestRoleAwareUserSshConfig._build_topology_instance()
+        sandbox.allocation_unit.get_stack_name = mocker.MagicMock()
+        sandbox.allocation_unit.get_stack_name.return_value = 'stack-name'
+        ssh_access_name = f'pool-id-{sandbox.allocation_unit.pool.id}-sandbox-id-{sandbox.id}-user'
+        SandboxRoleKeypair.objects.create(
+            sandbox=sandbox,
+            role='red-team',
+            private_key='red-team-private',
+            public_key='red-team-public',
+        )
+
+        in_memory_zip_file = sandboxes.get_user_ssh_access(sandbox, users_roles)
+
+        with zipfile.ZipFile(in_memory_zip_file, 'r', zipfile.ZIP_DEFLATED) as zip_file:
+            names = set(zip_file.namelist())
+            config = sshconfig.CrczpSSHConfig.from_str(
+                zip_file.read(f'{ssh_access_name}-config').decode('utf-8')
+            )
+            identity_files = {
+                host.get('IdentityFile').removeprefix('~/.ssh/') for host in config.hosts
+            }
+            assert identity_files <= names
 
     def test_get_user_ssh_access_carries_one_key_per_held_role(self, mocker, sandbox):
         """The zip carries the flat key plus one private-key file per role held."""
