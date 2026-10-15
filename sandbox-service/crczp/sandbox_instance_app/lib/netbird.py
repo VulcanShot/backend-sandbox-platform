@@ -211,11 +211,11 @@ def _provision_single_entrypoint(
     nbr.save()
 
     if not access_group_ids:
-        # No role's access group resolved for this entrypoint (an empty declared
-        # list, a role named on no provisioned access row, or every named role
-        # failing to provision): a route or policy sourced from no group is
-        # rejected by Netbird, so none is created, and the entrypoint stays
-        # reachable by nobody rather than half-provisioned.
+        # No role's access group resolved for this entrypoint (a role named on no
+        # provisioned access row, or every named role failing to provision): a
+        # route or policy sourced from no group is rejected by Netbird, so none
+        # is created, and the entrypoint stays reachable by nobody rather than
+        # half-provisioned.
         LOG.warning('netbird_entrypoint_unreachable', sandbox_id=sandbox.id, host=host_name)
         return nbr
 

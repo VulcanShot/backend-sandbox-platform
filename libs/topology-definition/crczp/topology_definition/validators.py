@@ -360,9 +360,14 @@ class TopologyValidation:  # pylint: disable=too-many-public-methods
     @staticmethod
     def validate_accessible_by_roles(obj: object, roles: StrList | None) -> None:
         """
-        Validate a declared accessible_by_roles list.
+        Validate a declared accessible_by_roles list. An empty list is rejected.
         """
         if roles is not None:
+            if not roles:
+                raise ValueError(
+                    f'{obj.__class__.__name__}.accessible_by_roles must not be an empty list; '
+                    'omit the field to admit every role, or name at least one role to admit.'
+                )
             TopologyValidation._validate_role_list(obj, roles, 'accessible_by_roles')
 
     @staticmethod

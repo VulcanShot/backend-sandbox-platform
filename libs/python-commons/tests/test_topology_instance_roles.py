@@ -68,7 +68,7 @@ groups: []
 """
 
 # Reach: a machine on two networks — one universally accessible (boolean), one
-# role-gated to blue-team — plus an orphan network whose accessible_by_roles is empty.
+# role-gated to blue-team.
 REACH_DEFINITION = """
 name: role-reach-sandbox
 hosts:
@@ -93,10 +93,6 @@ networks:
   - name: target-lan
     cidr: 10.10.40.0/24
     accessible_by_roles: [blue-team]
-
-  - name: locked-lan
-    cidr: 10.10.50.0/24
-    accessible_by_roles: []
 
 net_mappings:
   - host: victim
@@ -151,18 +147,6 @@ def test_role_list_denies_on_disjoint_sets(visibility_topology_instance: Topolog
     ti = visibility_topology_instance
     victim = ti.get_node('victim')
     assert victim not in ti.get_visible_hosts(frozenset({'blue-team'}))
-
-
-def test_empty_role_list_denies_every_users_roles(
-    reach_topology_instance: TopologyInstance,
-) -> None:
-    """An empty declared role set denies everyone, including a privileged requester."""
-    ti = reach_topology_instance
-    locked_lan = ti.get_network('locked-lan')
-    assert locked_lan is not None
-    assert ti.network_has_reach(locked_lan, frozenset({'blue-team'})) is False
-    assert ti.network_has_reach(locked_lan, frozenset()) is False
-    assert ti.network_has_reach(locked_lan, UNIVERSAL_ROLES) is False
 
 
 def test_boolean_never_consults_users_roles(reach_topology_instance: TopologyInstance) -> None:

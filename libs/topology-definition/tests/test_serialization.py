@@ -660,6 +660,25 @@ vpn:
 """
             )
 
+    def test_vpn_entrypoint_accessible_by_roles_rejected_empty_list(
+        self, topology_definition_string: str
+    ) -> None:
+        """
+        A VpnEntrypoint's accessible_by_roles: [] is rejected.
+        """
+        with pytest.raises(YamlizingError):
+            TopologyDefinition.load(
+                topology_definition_string
+                + """
+vpn:
+  entrypoints:
+    - name: server
+      routes:
+        - 10.10.0.0/16
+      accessible_by_roles: []
+"""
+            )
+
     def test_image_name_strip(self, topology_definition: TopologyDefinition) -> None:
         """
         Test image name strip.
@@ -894,6 +913,17 @@ vpn:
             '    cidr: 10.10.20.0/24\n'
             '    accessible_by_roles: [red-team, 1]\n\n'
             '  - name: home-switch',
+        )
+        with pytest.raises(YamlizingError):
+            TopologyDefinition.load(modified)
+
+    def test_accessible_by_roles_rejected_empty_list(self, topology_definition_string: str) -> None:
+        """
+        accessible_by_roles: [] is rejected.
+        """
+        modified = topology_definition_string.replace(
+            '    cidr: 10.10.20.0/24\n\n  - name: home-switch',
+            '    cidr: 10.10.20.0/24\n    accessible_by_roles: []\n\n  - name: home-switch',
         )
         with pytest.raises(YamlizingError):
             TopologyDefinition.load(modified)
