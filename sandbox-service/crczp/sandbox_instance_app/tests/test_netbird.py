@@ -32,10 +32,11 @@ NETBIRD_MODULE = 'crczp.sandbox_instance_app.lib.netbird'
 
 @dataclass
 class FakeEntrypoint:  # pylint: disable=too-few-public-methods
-    """Stand-in for a topology VPN entrypoint with a name and routes."""
+    """Stand-in for a topology VPN entrypoint with a name, routes, and declared roles."""
 
     name: str
     routes: list[str]
+    accessible_by_roles: list[str] | None = None
 
 
 @dataclass
@@ -665,10 +666,40 @@ class TestProvision:
 
         netbird.provision_netbird_for_sandbox(sandbox)
 
-        _name, kwargs = client.create_policy.call_args
+        kwargs = client.create_policy.call_args.kwargs
         assert kwargs['source_group_ids'] == ['flat-grp']
         nbr = SandboxNetbirdResources.objects.get(sandbox=sandbox, entrypoint_host_name='server')
         assert nbr.get_source_role_list() == []
+
+    def test_role_scoped_entrypoint_sources_only_its_named_roles(
+        self, mocker, sandbox, netbird_cfg
+    ):
+        """An entrypoint naming specific roles sources only those roles' groups."""
+        mocker.patch(
+            f'{NETBIRD_MODULE}._get_declared_roles', return_value={'red-team', 'blue-team'}
+        )
+        client = MagicMock()
+        client.create_group.side_effect = ['flat-grp', 'blue-grp', 'red-grp', 'host-grp']
+        client.create_setup_key.side_effect = [
+            ('flat-key-id', 'flat-key'),
+            ('blue-key-id', 'blue-key'),
+            ('red-key-id', 'red-key'),
+            ('host-key-id', 'host-key'),
+        ]
+        client.create_route.return_value = 'route-1'
+        client.create_policy.return_value = 'pol-1'
+        mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client', return_value=client)
+        mocker.patch(
+            f'{NETBIRD_MODULE}._get_vpn_entrypoints',
+            return_value=[FakeEntrypoint('server', ['10.0.0.0/24'], ['red-team'])],
+        )
+
+        netbird.provision_netbird_for_sandbox(sandbox)
+
+        kwargs = client.create_policy.call_args.kwargs
+        assert kwargs['source_group_ids'] == ['red-grp']
+        nbr = SandboxNetbirdResources.objects.get(sandbox=sandbox, entrypoint_host_name='server')
+        assert nbr.get_source_role_list() == ['red-team']
 
 
 class TestDestroy:
@@ -829,6 +860,41 @@ class TestDestroy:
         assert max(ephemeral_calls) < min(group_calls)
         assert calls.count('delete_group') == 2
         assert not SandboxNetbirdEphemeralKey.objects.filter(sandbox=sandbox).exists()
+
+    def test_destroying_a_freshly_minted_multi_role_key_leaves_nothing_behind(
+        self, mocker, sandbox, netbird_cfg
+    ):
+        """A key minted through the real resolution path is fully torn down afterward."""
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='red-team', access_group_id='red-grp'
+        )
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='blue-team', access_group_id='blue-grp'
+        )
+        client = MagicMock()
+        client.create_setup_key.return_value = ('ephemeral-id', 'ephemeral-key')
+        client.list_group_peer_ids.return_value = []
+        mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client', return_value=client)
+        result = netbird.resolve_vpn_setup_key(sandbox, frozenset({'red-team', 'blue-team'}))
+        assert result == 'ephemeral-key'
+
+        netbird.destroy_netbird_for_sandbox(sandbox)
+
+        calls = list(client.method_calls)
+        ephemeral_delete = next(
+            i
+            for i, c in enumerate(calls)
+            if c[0] == 'delete_setup_key' and c.args[0] == 'ephemeral-id'
+        )
+        group_deletes = [
+            i
+            for i, c in enumerate(calls)
+            if c[0] == 'delete_group' and c.args[0] in ('red-grp', 'blue-grp')
+        ]
+        assert len(group_deletes) == 2
+        assert ephemeral_delete < min(group_deletes)
+        assert not SandboxNetbirdEphemeralKey.objects.filter(sandbox=sandbox).exists()
+        assert not SandboxNetbirdAccess.objects.filter(sandbox=sandbox).exists()
 
     def test_destroys_the_flat_access_row_last(self, mocker, sandbox):
         """The flat row's group is destroyed only after every role row's key is gone.
@@ -1030,8 +1096,11 @@ class TestResolveVpnSetupKey:
         result = netbird.resolve_vpn_setup_key(sandbox, frozenset({'red-team', 'blue-team'}))
 
         assert result == 'ephemeral-key'
-        _name, kwargs = client.create_setup_key.call_args
+        kwargs = client.create_setup_key.call_args.kwargs
+        stack_name = netbird._short_stack_name(sandbox.allocation_unit.get_stack_name())
         assert set(kwargs['auto_group_ids']) == {'red-grp', 'blue-grp'}
+        assert kwargs['expires_in_seconds'] == 1209600
+        assert kwargs['name'] == f'{stack_name}-access-ephemeral_blue-team_red-team'
         # Not written onto either role's own row.
         red.refresh_from_db()
         blue.refresh_from_db()
@@ -1078,6 +1147,32 @@ class TestResolveVpnSetupKey:
 
         assert netbird.resolve_vpn_setup_key(sandbox, frozenset({'red-team', 'blue-team'})) is None
 
+    def test_multi_role_holder_gets_none_on_a_config_error(self, mocker, sandbox, netbird_cfg):
+        """A missing or invalid Netbird configuration yields None rather than raising."""
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='red-team', access_group_id='red-grp'
+        )
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='blue-team', access_group_id='blue-grp'
+        )
+        mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client', side_effect=NetbirdConfigError)
+
+        assert netbird.resolve_vpn_setup_key(sandbox, frozenset({'red-team', 'blue-team'})) is None
+
+    def test_multi_role_holder_gets_none_when_netbird_unconfigured(
+        self, mocker, sandbox, netbird_cfg
+    ):
+        """Netbird not being configured at all yields None rather than raising."""
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='red-team', access_group_id='red-grp'
+        )
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='blue-team', access_group_id='blue-grp'
+        )
+        mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client', return_value=None)
+
+        assert netbird.resolve_vpn_setup_key(sandbox, frozenset({'red-team', 'blue-team'})) is None
+
     def test_privileged_requester_role_free_pool_gets_the_flat_key(self, sandbox):
         """UNIVERSAL_ROLES in a role-free pool gets the role='' row's stored key."""
         SandboxNetbirdAccess.objects.create(sandbox=sandbox, access_setup_key_value='flat-key')
@@ -1101,7 +1196,7 @@ class TestResolveVpnSetupKey:
         result = netbird.resolve_vpn_setup_key(sandbox, UNIVERSAL_ROLES)
 
         assert result == 'ephemeral-key'
-        _name, kwargs = client.create_setup_key.call_args
+        kwargs = client.create_setup_key.call_args.kwargs
         assert set(kwargs['auto_group_ids']) == {'red-grp', 'blue-grp'}
 
     def test_reason_is_none_when_a_key_is_resolved(self, sandbox):
