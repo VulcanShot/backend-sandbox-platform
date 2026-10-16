@@ -16,6 +16,7 @@ from crczp.sandbox_common_lib.netbird_client import (
 )
 from crczp.sandbox_definition_app.lib import definitions
 from crczp.sandbox_instance_app.models import (
+    FLAT_ROLE,
     Sandbox,
     SandboxNetbirdAccess,
     SandboxNetbirdEphemeralKey,
@@ -263,13 +264,13 @@ def _provision_role_access(
     """
     access_rows: dict[str, SandboxNetbirdAccess] = {}
     flat_group_id: str | None = None
-    for role in ['', *sorted(declared_roles)]:
-        access_name = f'{stack_name}-access' if not role else f'{stack_name}-access_{role}'
+    for role in [FLAT_ROLE, *sorted(declared_roles)]:
+        access_name = f'{stack_name}-access' if role == FLAT_ROLE else f'{stack_name}-access_{role}'
         try:
             access, _ = SandboxNetbirdAccess.objects.get_or_create(sandbox=sandbox, role=role)
             access_rows[role] = access
             _provision_access(client, access, access_name, key_expiry_seconds, flat_group_id)
-            if not role:
+            if role == FLAT_ROLE:
                 flat_group_id = access.access_group_id
             LOG.info(
                 'netbird_access_provisioned',
@@ -327,10 +328,10 @@ def _source_roles(
 
     No declaration (None) names the flat role='', reachable by every player regardless
     of team — homologous to a Network's accessible_by_user: True fallback. A declared
-    (possibly empty) list names exactly those roles; a role with no provisioned group
-    (or an empty list) contributes nothing, leaving the entrypoint reachable by no one.
+    list names exactly those roles; a role with no provisioned group contributes
+    nothing, leaving the entrypoint reachable by no one.
     """
-    candidate_roles = [''] if ep_roles is None else list(ep_roles)
+    candidate_roles = [FLAT_ROLE] if ep_roles is None else list(ep_roles)
     return [
         role
         for role in candidate_roles
@@ -767,7 +768,7 @@ def destroy_netbird_for_sandbox(sandbox: Sandbox) -> None:
 
 def _flat_access_row(sandbox: Sandbox) -> SandboxNetbirdAccess | None:
     """Return the sandbox's flat (role='') access row, or None if never provisioned."""
-    return SandboxNetbirdAccess.objects.filter(sandbox=sandbox, role='').first()
+    return SandboxNetbirdAccess.objects.filter(sandbox=sandbox, role=FLAT_ROLE).first()
 
 
 def resolve_vpn_setup_key(sandbox: Sandbox, users_roles: UsersRoles) -> str | None:
@@ -795,7 +796,7 @@ def resolve_vpn_setup_key_with_reason(
     setup key never finished provisioning), or 'error' (minting a multi-role key
     failed).
     """
-    declared_rows = SandboxNetbirdAccess.objects.filter(sandbox=sandbox).exclude(role='')
+    declared_rows = SandboxNetbirdAccess.objects.filter(sandbox=sandbox).exclude(role=FLAT_ROLE)
     if not declared_rows.exists():
         flat_access = _flat_access_row(sandbox)
         if flat_access and flat_access.access_setup_key_value:

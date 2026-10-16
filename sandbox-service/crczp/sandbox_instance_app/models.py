@@ -541,13 +541,17 @@ class SystemProcess(ExternalDependency):
         return f'STAGE: {self.allocation_stage.id}, PROCESS: {self.process_id}'
 
 
+FLAT_ROLE = ''
+"""The role value marking a sandbox's flat, role-free Netbird access row."""
+
+
 class SandboxNetbirdAccess(models.Model):
     """
     Stores one Netbird "access" group and setup key created for a sandbox. Every
-    sandbox has exactly one row with role='', the access group and setup key a
-    role-free pool's VPN entrypoints and clients use; a sandbox whose pool
-    declares roles additionally has one further row per declared role, and its
-    entrypoints and clients source from those role rows instead.
+    sandbox has exactly one row with role='', the flat access group and setup key
+    reachable by every player regardless of team; a sandbox whose pool declares
+    roles additionally has one further row per declared role, each widening its
+    own setup key to also name the flat group.
 
     All fields except role are nullable so that a partial-failure state can be
     persisted: the cleanup path tolerates nulls and issues 404-tolerant deletes.
@@ -566,7 +570,7 @@ class SandboxNetbirdAccess(models.Model):
     )
     role = models.CharField(
         max_length=128,
-        default='',
+        default=FLAT_ROLE,
         blank=True,
         help_text=(
             "Declared role this access group is scoped to; '' for the sandbox's shared access."
