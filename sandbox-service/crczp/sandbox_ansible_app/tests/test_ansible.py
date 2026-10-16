@@ -122,14 +122,8 @@ class TestPrepareSshDir:
         runner = AllocationAnsibleRunner('/tmp')
         runner.prepare_ssh_dir(sandbox.allocation_unit.pool, sandbox)
 
-        written_paths = {call.args[0] for call in save_file.call_args_list}
-        assert runner.host_ssh_path('user_key_red-team.pub') in written_paths
-        role_file_contents = {
-            call.args[0]: call.args[1]
-            for call in save_file.call_args_list
-            if call.args[0] == runner.host_ssh_path('user_key_red-team.pub')
-        }
-        assert role_file_contents[runner.host_ssh_path('user_key_red-team.pub')] == 'pub-red'
+        written = {call.args[0]: call.args[1] for call in save_file.call_args_list}
+        assert written[runner.host_ssh_path('user_key_red-team.pub')] == 'pub-red'
 
     def test_prepare_ssh_dir_role_free_writes_no_role_files(self, mocker):
         """A role-free sandbox writes only the flat public-key file, nothing role-scoped."""
