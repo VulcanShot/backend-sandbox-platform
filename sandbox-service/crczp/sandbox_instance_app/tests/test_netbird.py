@@ -277,6 +277,36 @@ class TestProvision:
 
         client.create_group.assert_not_called()
         assert SandboxNetbirdResources.objects.filter(sandbox=sandbox).count() == 0
+        netbird.LOG.warning.assert_called_once_with(
+            'netbird_provision_skipped',
+            sandbox_id=sandbox.id,
+            reason='vpn_settings_lookup_failed',
+            error='git fetch failed',
+        )
+
+    def test_skipped_when_declared_roles_lookup_fails(self, mocker, sandbox):
+        """A failing role lookup, past the entrypoint/DNS fetch, must not propagate or provision."""
+        client = MagicMock()
+        mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client', return_value=client)
+        mocker.patch(
+            f'{NETBIRD_MODULE}._get_vpn_entrypoints',
+            return_value=[FakeEntrypoint('server', ['10.0.0.0/24'])],
+        )
+        mocker.patch(f'{NETBIRD_MODULE}._get_vpn_dns', return_value=None)
+        mocker.patch(
+            f'{NETBIRD_MODULE}._get_declared_roles', side_effect=RuntimeError('git fetch failed')
+        )
+
+        netbird.provision_netbird_for_sandbox(sandbox)
+
+        client.create_group.assert_not_called()
+        assert SandboxNetbirdResources.objects.filter(sandbox=sandbox).count() == 0
+        netbird.LOG.warning.assert_called_once_with(
+            'netbird_provision_skipped',
+            sandbox_id=sandbox.id,
+            reason='vpn_settings_lookup_failed',
+            error='git fetch failed',
+        )
 
     def test_entry_point_never_raises_on_unexpected_error(self, mocker, sandbox):
         """The public entry point swallows unexpected errors.
