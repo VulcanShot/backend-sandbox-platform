@@ -460,6 +460,34 @@ vpn:
 """
             )
 
+    def test_vpn_entrypoint_scalar_item_rejected(self, topology_definition_string: str) -> None:
+        """
+        A bare scalar entrypoints item (a host name, not a mapping) raises YamlizingError,
+        not a raw ValueError from unpacking its node as if it were a mapping.
+        """
+        with pytest.raises(YamlizingError):
+            TopologyDefinition.load(
+                topology_definition_string
+                + """
+vpn:
+  entrypoints: [vpn-gw]
+"""
+            )
+
+    def test_vpn_entrypoint_list_item_rejected(self, topology_definition_string: str) -> None:
+        """
+        A nested-list entrypoints item raises YamlizingError, not a raw TypeError from
+        unpacking its node as if it were a mapping.
+        """
+        with pytest.raises(YamlizingError):
+            TopologyDefinition.load(
+                topology_definition_string
+                + """
+vpn:
+  entrypoints: [[vpn-gw]]
+"""
+            )
+
     def test_vpn_dns_loaded(self, topology_definition_string: str) -> None:
         """
         vpn.dns with servers and search_domains is parsed correctly.
