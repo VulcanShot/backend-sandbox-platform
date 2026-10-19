@@ -271,8 +271,6 @@ def _provision_role_access(
             access, _ = SandboxNetbirdAccess.objects.get_or_create(sandbox=sandbox, role=role)
             access_rows[role] = access
             _provision_access(client, access, access_name, key_expiry_seconds, flat_group_id)
-            if role == FLAT_ROLE:
-                flat_group_id = access.access_group_id
             LOG.info(
                 'netbird_access_provisioned',
                 sandbox_id=sandbox.id,
@@ -286,6 +284,10 @@ def _provision_role_access(
                 else 'netbird_provision_access_error'
             )
             LOG.warning(event, sandbox_id=sandbox.id, role=role, error=str(exc))
+        # Outside the try: unscoped entrypoints source from the flat group whenever
+        # it exists, so role keys must name it even if the flat key itself failed.
+        if role == FLAT_ROLE and role in access_rows:
+            flat_group_id = access_rows[role].access_group_id
     return access_rows
 
 

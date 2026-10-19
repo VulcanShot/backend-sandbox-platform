@@ -711,6 +711,30 @@ class TestProvision:  # pylint: disable=too-many-public-methods
         assert set(flat_call.kwargs['auto_group_ids']) == {'flat-grp'}
         assert set(red_call.kwargs['auto_group_ids']) == {'red-grp', 'flat-grp'}
 
+    def test_role_keys_name_the_flat_group_even_when_its_own_key_fails(
+        self, mocker, sandbox, netbird_cfg
+    ):
+        """Regression: a failed flat key must not drop the flat group from role keys.
+
+        Unscoped entrypoints still source from the flat group once it exists, so
+        role holders would otherwise lose them.
+        """
+        mocker.patch(f'{NETBIRD_MODULE}._get_declared_roles', return_value={'red-team'})
+        client = MagicMock()
+        client.create_group.side_effect = ['flat-grp', 'red-grp']
+        client.create_setup_key.side_effect = [
+            NetbirdApiError('POST', 'url', 500, 'fail'),
+            ('red-key-id', 'red-key'),
+        ]
+        mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client', return_value=client)
+        mocker.patch(f'{NETBIRD_MODULE}._get_vpn_entrypoints', return_value=[])
+        mocker.patch(f'{NETBIRD_MODULE}._get_vpn_dns', return_value=FakeDns(['10.0.0.5']))
+
+        netbird.provision_netbird_for_sandbox(sandbox)
+
+        red_call = client.create_setup_key.call_args_list[1]
+        assert set(red_call.kwargs['auto_group_ids']) == {'red-grp', 'flat-grp'}
+
     def test_unscoped_entrypoint_sources_from_the_flat_group_alone(
         self, mocker, sandbox, netbird_cfg
     ):
