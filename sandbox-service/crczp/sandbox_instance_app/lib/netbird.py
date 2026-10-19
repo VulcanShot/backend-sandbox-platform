@@ -6,6 +6,7 @@ from typing import Any
 
 import structlog
 from django.conf import settings
+from django.db import IntegrityError, transaction
 
 from crczp.cloud_commons import UsersRoles
 from crczp.sandbox_common_lib.netbird_client import (
@@ -875,9 +876,28 @@ def _mint_ephemeral_vpn_setup_key(
     except Exception as exc:  # pylint: disable=broad-exception-caught
         LOG.warning('netbird_ephemeral_key_failed', sandbox_id=sandbox.id, error=str(exc))
         return None
-    SandboxNetbirdEphemeralKey.objects.create(
-        sandbox=sandbox, role_set=role_set, key_id=key_id, key_value=key_value
-    )
+    try:
+        with transaction.atomic():
+            SandboxNetbirdEphemeralKey.objects.create(
+                sandbox=sandbox, role_set=role_set, key_id=key_id, key_value=key_value
+            )
+    except IntegrityError:
+        # A concurrent request for the same role set stored its key first. Hand out
+        # that one and drop ours: an unrecorded key would keep Netbird from deleting
+        # the groups it names at teardown.
+        try:
+            client.delete_setup_key(key_id)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            LOG.warning(
+                'netbird_ephemeral_key_cleanup_failed',
+                sandbox_id=sandbox.id,
+                key_id=key_id,
+                error=str(exc),
+            )
+        winner = SandboxNetbirdEphemeralKey.objects.filter(
+            sandbox=sandbox, role_set=role_set
+        ).first()
+        return winner.key_value if winner is not None else None
     return key_value
 
 

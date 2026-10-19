@@ -1198,6 +1198,37 @@ class TestResolveVpnSetupKey:
         assert result == 'old-key'
         client_factory.assert_not_called()
 
+    def test_concurrent_first_mint_hands_out_the_stored_key_and_drops_its_own(
+        self, mocker, sandbox, netbird_cfg
+    ):
+        """Regression: losing a concurrent first mint must neither 500 nor leak its key."""
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='red-team', access_group_id='red-grp'
+        )
+        SandboxNetbirdAccess.objects.create(
+            sandbox=sandbox, role='blue-team', access_group_id='blue-grp'
+        )
+        client = MagicMock()
+
+        def _concurrent_request_stores_first(**_kwargs):
+            SandboxNetbirdEphemeralKey.objects.create(
+                sandbox=sandbox,
+                role_set='blue-team,red-team',
+                key_id='winner-id',
+                key_value='winner-key',
+            )
+            return ('loser-id', 'loser-key')
+
+        client.create_setup_key.side_effect = _concurrent_request_stores_first
+        mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client', return_value=client)
+
+        result = netbird.resolve_vpn_setup_key(sandbox, frozenset({'red-team', 'blue-team'}))
+
+        assert result == 'winner-key'
+        client.delete_setup_key.assert_called_once_with('loser-id')
+        stored = SandboxNetbirdEphemeralKey.objects.filter(sandbox=sandbox)
+        assert list(stored.values_list('key_id', flat=True)) == ['winner-id']
+
     def test_multi_role_holder_gets_none_when_netbird_unreachable(
         self, mocker, sandbox, netbird_cfg
     ):
