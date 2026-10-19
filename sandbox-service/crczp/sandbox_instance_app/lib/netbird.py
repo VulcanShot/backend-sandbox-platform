@@ -531,7 +531,11 @@ def _provision_netbird_for_sandbox(sandbox: Sandbox) -> None:
     # transaction — holding one open across network I/O would pin a connection.
     if Sandbox.objects.filter(pk=sandbox.pk).exists():
         return
-    _teardown_provisioned_resources(client, sandbox, created, list(access_rows.values()))
+    # Same order as destroy_netbird_for_sandbox: role keys name the flat group,
+    # so the flat row ('', sorting last) goes after every role row.
+    _teardown_provisioned_resources(
+        client, sandbox, created, sorted(access_rows.values(), key=lambda a: a.role, reverse=True)
+    )
     LOG.warning('netbird_provision_aborted_sandbox_deleted', sandbox_id=sandbox.id)
 
 

@@ -214,7 +214,7 @@ class TestGetVpnDns:
         assert netbird._get_vpn_dns(sandbox) is None
 
 
-class TestProvision:
+class TestProvision:  # pylint: disable=too-many-public-methods
     """Tests for provision_netbird_for_sandbox."""
 
     @pytest.fixture(autouse=True)
@@ -512,6 +512,43 @@ class TestProvision:
         # The created access group is torn down from the retained handle even
         # though its DB row was deleted before the error handler ran.
         client.delete_group.assert_any_call('access-grp')
+
+    def test_end_guard_destroys_the_flat_access_row_last(self, mocker, sandbox, netbird_cfg):
+        """Regression: Netbird refuses to delete a group a setup key still names.
+
+        Every role key also names the flat group, so the end guard must delete the
+        role rows before the flat one, as destroy_netbird_for_sandbox does.
+        """
+        mocker.patch(f'{NETBIRD_MODULE}._get_declared_roles', return_value={'red-team'})
+        client = MagicMock()
+        client.create_group.side_effect = ['flat-grp', 'red-grp', 'host-grp']
+        client.create_setup_key.side_effect = [
+            ('flat-key-id', 'flat-key'),
+            ('red-key-id', 'red-key'),
+            ('host-key-id', 'host-key'),
+        ]
+        client.create_route.return_value = 'route-1'
+        client.create_policy.return_value = 'pol-1'
+        client.list_group_peer_ids.return_value = []
+        mocker.patch(f'{NETBIRD_MODULE}.get_netbird_client', return_value=client)
+        mocker.patch(
+            f'{NETBIRD_MODULE}._get_vpn_entrypoints',
+            return_value=[FakeEntrypoint('server', ['10.0.0.0/24'])],
+        )
+        exists_results = iter([True, False])
+        mocker.patch(
+            f'{NETBIRD_MODULE}.Sandbox.objects.filter',
+            side_effect=lambda **_kw: type(
+                '_QS', (), {'exists': lambda self: next(exists_results)}
+            )(),
+        )
+
+        netbird.provision_netbird_for_sandbox(sandbox)
+
+        deletes = [c for c in client.mock_calls if c[0] in ('delete_setup_key', 'delete_group')]
+        flat_group_delete = deletes.index(call.delete_group('flat-grp'))
+        assert deletes.index(call.delete_setup_key('red-key-id')) < flat_group_delete
+        assert deletes.index(call.delete_group('red-grp')) < flat_group_delete
 
     def test_creates_dns_primary_nameserver_group(self, mocker, sandbox, netbird_cfg):
         """vpn.dns without search domains creates a primary nameserver group."""
