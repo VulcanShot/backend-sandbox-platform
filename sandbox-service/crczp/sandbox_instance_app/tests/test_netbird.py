@@ -1328,7 +1328,7 @@ class TestResolveVpnSetupKey:
         assert netbird.resolve_vpn_setup_key_with_reason(sandbox, frozenset()) == ('flat-key', None)
 
     def test_reason_is_not_provisioned_for_an_unprovisioned_flat_pool(self, sandbox):
-        """A role-free pool whose flat row never got a key reports not_provisioned."""
+        """A sandbox with no access row at all (no VPN) reports not_provisioned."""
         assert netbird.resolve_vpn_setup_key_with_reason(sandbox, frozenset()) == (
             None,
             'not_provisioned',

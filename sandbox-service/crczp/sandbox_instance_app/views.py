@@ -1251,17 +1251,20 @@ class SandboxVpnView(APIView):
     Returns the Netbird VPN client configuration for this sandbox.
 
     The setup key granted is scoped to the requesting user's own roles in the
-    pool: a role-free pool grants its one shared access setup key to everyone;
-    a role-declaring pool grants a role's own key to a single-role holder, a
-    freshly minted key spanning every held role's access group to a multi-role
-    holder, and no key to a roleless requester. ``routes`` is the union of the
-    CIDRs of entrypoints the same roles can reach.
+    pool: a role-free pool grants its one shared access setup key to everyone.
+    A role-declaring pool grants a role's own key to a single-role holder, one
+    key spanning every held role's access group to a multi-role holder or a
+    privileged requester (minted on the first request for that role
+    combination and reused afterwards), and the shared key to a requester
+    holding none of the sandbox's roles. ``routes`` is the union of the CIDRs
+    of entrypoints the same roles can reach.
 
     ``setup_key`` is null whenever ``reason`` is not: ``no_role`` (the requester
-    holds none of the sandbox's declared roles), ``not_provisioned`` (an
-    admitted role's Netbird objects have not, or never will, finish
-    provisioning), or ``error`` (minting a multi-role key failed). ``reason`` is
-    null whenever ``setup_key`` is present.
+    holds none of the sandbox's roles and no shared key is provisioned either),
+    ``not_provisioned`` (the sandbox has no VPN, or the Netbird objects the
+    requester is admitted to never finished provisioning), or ``error``
+    (minting a multi-role key failed). ``reason`` is null whenever ``setup_key``
+    is present.
 
     ``command`` is the ready-to-run NetBird CLI line a client pastes to connect
     (it embeds ``management_url`` and ``setup_key``); it is null whenever

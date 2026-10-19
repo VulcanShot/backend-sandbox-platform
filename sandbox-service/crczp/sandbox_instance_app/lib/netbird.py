@@ -799,9 +799,9 @@ def resolve_vpn_setup_key_with_reason(
 
     The reason is None whenever a key is returned; otherwise one of: 'no_role'
     (the requester holds none of the sandbox's declared roles, and no flat key is
-    provisioned either), 'not_provisioned' (an admitted role's access group or
-    setup key never finished provisioning), or 'error' (minting a multi-role key
-    failed).
+    provisioned either), 'not_provisioned' (the sandbox has no access row at all,
+    i.e. no VPN, or the flat row or an admitted role's access group or setup key
+    never finished provisioning), or 'error' (minting a multi-role key failed).
     """
     declared_rows = SandboxNetbirdAccess.objects.filter(sandbox=sandbox).exclude(role=FLAT_ROLE)
     if not declared_rows.exists():
